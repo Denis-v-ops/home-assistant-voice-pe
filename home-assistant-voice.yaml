@@ -1323,15 +1323,12 @@ script:
           }
 
   - id: play_random_wake
-    mode: restart
     then:
-      # call your existing play_sound script, but pass in a random file
       - script.execute:
           id: play_sound
           parameters:
             priority: true
             sound_file: !lambda |-
-              // List all your wake‑sound AudioFile IDs here
               static const audio::AudioFile* files[] = {
                 id(glados_wake_1),
                 id(glados_wake_2),
@@ -1539,17 +1536,17 @@ media_player:
       - id: error_cloud_expired
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
       - id: glados_wake_1
-        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/refs/heads/dev/sounds/wake/1.flac
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/1.flac
       - id: glados_wake_2
-        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/refs/heads/dev/sounds/wake/2.flac
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/2.flac
       - id: glados_wake_3
-        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/refs/heads/dev/sounds/wake/3.flac
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/3.flac
       - id: glados_wake_4
-        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/refs/heads/dev/sounds/wake/4.flac
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/4.flac
       - id: glados_wake_5
-        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/refs/heads/dev/sounds/wake/5.flac
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/5.flac
       - id: glados_wake_6
-        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/refs/heads/dev/sounds/wake/6.flac
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/6.flac
 
 voice_kit:
   i2c_id: internal_i2c
@@ -1580,12 +1577,12 @@ audio_dac:
 micro_wake_word:
   id: mww
   models:
-    # - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-    #   id: okay_nabu
-    # - model: hey_jarvis
-    #   id: hey_jarvis
-    # - model: hey_mycroft
-    #  id: hey_mycroft
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
+      id: okay_nabu
+    - model: hey_jarvis
+      id: hey_jarvis
+    - model: hey_mycroft
+      id: hey_mycroft
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
@@ -1632,8 +1629,8 @@ voice_assistant:
   id: va
   microphone: asr_mic
   media_player: external_media_player
-  # micro_wake_word: mww
-  use_wake_word: true
+  micro_wake_word: mww
+  use_wake_word: false
   noise_suppression_level: 0
   auto_gain: 0 dbfs
   volume_multiplier: 1
