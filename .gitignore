@@ -138,3 +138,5 @@ sdkconfig.*
 .tests/
 
 /components
+repomix-output.txt.md
+.repomix/bundles.json
