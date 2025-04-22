@@ -1328,7 +1328,7 @@ script:
           id: play_sound
           priority: true
           sound_file: !lambda |-
-            static const audio::AudioFile* files[] = {
+            static audio::AudioFile* files[] = {
               id(glados_wake_1),
               id(glados_wake_2),
               id(glados_wake_3),
