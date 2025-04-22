@@ -1326,20 +1326,19 @@ script:
     then:
       - script.execute:
           id: play_sound
-          parameters:
-            priority: true
-            sound_file: !lambda |-
-              static const audio::AudioFile* files[] = {
-                id(glados_wake_1),
-                id(glados_wake_2),
-                id(glados_wake_3),
-                id(glados_wake_4),
-                id(glados_wake_5),
-                id(glados_wake_6)
-              };
-              size_t n = sizeof(files) / sizeof(files[0]);
-              // use ESP32’s RNG
-              return files[esp_random() % n];
+          priority: true
+          sound_file: !lambda |-
+            static const audio::AudioFile* files[] = {
+              id(glados_wake_1),
+              id(glados_wake_2),
+              id(glados_wake_3),
+              id(glados_wake_4),
+              id(glados_wake_5),
+              id(glados_wake_6)
+            };
+            size_t n = sizeof(files) / sizeof(files[0]);
+            // use ESP32’s RNG
+            return files[esp_random() % n];
       - delay: 300ms
 
   # Script used to fetch the first active timer (Stored in global first_active_timer)
