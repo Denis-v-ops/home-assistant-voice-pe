@@ -272,7 +272,7 @@ def _validate_source_model_name(value):
     return MODEL_SOURCE_SCHEMA(
         {
             CONF_TYPE: TYPE_HTTP,
-            CONF_URL: f"https://github.com/esphome/micro-wake-word-models/raw/main/models/v2/{value}.json",
+            CONF_URL: f"https://github.com/Denis-v-ops/micro-wake-word-models/raw/main/models/v2/{value}.json",
         }
     )
 

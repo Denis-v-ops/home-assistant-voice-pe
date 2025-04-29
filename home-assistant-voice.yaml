@@ -1585,7 +1585,7 @@ micro_wake_word:
       id: hey_jarvis
     - model: hey_mycroft
       id: hey_mycroft
-    - model: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/model/nova.json
+    - model: nova
       id: nova
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
