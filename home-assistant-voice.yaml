@@ -1581,12 +1581,8 @@ micro_wake_word:
   models:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
       id: okay_nabu
-    - model: hey_jarvis
-      id: hey_jarvis
-    - model: nova
-      id: nova
-    - model: hey_mycroft
-      id: hey_mycroft
+    - model: nova_v2
+      id: nova_v2
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
