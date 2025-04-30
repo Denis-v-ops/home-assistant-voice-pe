@@ -1585,7 +1585,9 @@ micro_wake_word:
       id: hey_jarvis
     - model: hey_mycroft
       id: hey_mycroft
-    - model: nova
+    - model:
+        type: local
+        path: model/nova.json
       id: nova
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
