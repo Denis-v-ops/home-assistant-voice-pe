@@ -1583,12 +1583,10 @@ micro_wake_word:
       id: okay_nabu
     - model: hey_jarvis
       id: hey_jarvis
+    - model: nova
+      id: nova
     - model: hey_mycroft
       id: hey_mycroft
-    - model:
-        type: local
-        path: model/nova.json
-      id: nova
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
