@@ -1581,7 +1581,6 @@ micro_wake_word:
   models:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
       id: okay_nabu
-    - model: https://github.com/Denis-v-ops/micro-wake-word-models/releases/download/v1.0.0/nova_v2.json
     - model: https://github.com/Denis-v-ops/micro-wake-word-models/releases/download/v1.0.1/nova_v3.json
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
