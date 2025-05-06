@@ -1329,13 +1329,14 @@ script:
           priority: true
           sound_file: !lambda |-
             static audio::AudioFile* files[] = {
-              id(glados_wake_1),
-              id(glados_wake_2),
-              id(glados_wake_3),
-              id(glados_wake_4),
-              id(glados_wake_5),
-              id(glados_wake_6),
-              id(glados_wake_7)
+              id(nova_wake_1),
+              id(nova_wake_2),
+              id(nova_wake_3),
+              id(nova_wake_4),
+              id(nova_wake_5),
+              id(nova_wake_6),
+              id(nova_wake_7),
+              id(nova_wake_8)
             };
             size_t n = sizeof(files) / sizeof(files[0]);
             // use ESP32’s RNG
@@ -1535,19 +1536,19 @@ media_player:
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
       - id: error_cloud_expired
         file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
-      - id: glados_wake_1
+      - id: nova_wake_1
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/1.flac
-      - id: glados_wake_2
+      - id: nova_wake_2
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/2.flac
-      - id: glados_wake_3
+      - id: nova_wake_3
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/3.flac
-      - id: glados_wake_4
+      - id: nova_wake_4
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/4.flac
-      - id: glados_wake_5
+      - id: nova_wake_5
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/5.flac
-      - id: glados_wake_6
+      - id: nova_wake_6
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/6.flac
-      - id: glados_wake_7
+      - id: nova_wake_7
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/7.flac
 
 voice_kit:
@@ -1581,7 +1582,7 @@ micro_wake_word:
   models:
     - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
       id: okay_nabu
-    - model: https://github.com/Denis-v-ops/micro-wake-word-models/releases/download/v1.0.3/hey_nova.json
+    - model: https://github.com/Denis-v-ops/micro-wake-word-models/releases/download/v1.0.4/hey_nova_v2.json
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
       id: stop
       internal: true
