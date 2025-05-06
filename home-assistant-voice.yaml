@@ -1550,6 +1550,8 @@ media_player:
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/6.flac
       - id: nova_wake_7
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/7.flac
+      - id: nova_wake_8
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/8.flac
 
 voice_kit:
   i2c_id: internal_i2c
