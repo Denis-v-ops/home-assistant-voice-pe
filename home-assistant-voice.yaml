@@ -1341,7 +1341,7 @@ script:
             size_t n = sizeof(files) / sizeof(files[0]);
             // use ESP32’s RNG
             return files[esp_random() % n];
-      - delay: 300ms
+      - delay: 1000ms
 
   # Script used to fetch the first active timer (Stored in global first_active_timer)
   - id: fetch_first_active_timer
