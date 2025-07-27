@@ -87,12 +87,9 @@ api:
   on_client_disconnected:
     - script.execute: control_leds
 
-webserver:
-
 ota:
   - platform: esphome
     id: ota_esphome
-  - platform: web_server
 
 i2c:
   - id: internal_i2c
