@@ -1367,7 +1367,12 @@ script:
               id(nova_wake_1),
               id(nova_wake_2),
               id(nova_wake_3),
-              id(nova_wake_4)
+              id(nova_wake_4),
+              id(nova_wake_5),
+              id(nova_wake_6),
+              id(nova_wake_7),
+              id(nova_wake_8),
+              id(nova_wake_9)
             };
             size_t n = sizeof(files) / sizeof(files[0]);
             // use ESP32’s RNG
@@ -1571,6 +1576,16 @@ media_player:
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/3.flac
       - id: nova_wake_4
         file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/4.flac
+      - id: nova_wake_5
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/5.flac
+      - id: nova_wake_6
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/6.flac
+      - id: nova_wake_7
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/7.flac
+      - id: nova_wake_8
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/8.flac
+      - id: nova_wake_9
+        file: https://github.com/Denis-v-ops/home-assistant-voice-pe/raw/dev/sounds/wake/9.flac
 
 voice_kit:
   id: voice_kit_component
