@@ -1,0 +1,10 @@
+packages:
+  device: !include ../../home-assistant-voice.yaml
+
+substitutions:
+  external_components_path: ../../esphome/components
+  sounds_path: ../../sounds
+
+wifi:
+  ssid: ci-validation-network
+  password: ci-validation-password

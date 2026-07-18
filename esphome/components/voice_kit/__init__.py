@@ -143,6 +143,7 @@ OTA_VOICE_KIT_FLASH_ACTION_SCHEMA = cv.Schema(
     "voice_kit.flash",
     VoiceKitFlashAction,
     OTA_VOICE_KIT_FLASH_ACTION_SCHEMA,
+    synchronous=True,
 )
 async def voice_kit_flash_action_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])

@@ -137,6 +137,10 @@ sdkconfig.*
 
 .tests/
 
+# Per-device Realtime credentials and internal CA
+secrets.yaml
+!.github/ci/secrets.yaml
+
 /components
 repomix-output.txt.md
 .repomix/bundles.json
