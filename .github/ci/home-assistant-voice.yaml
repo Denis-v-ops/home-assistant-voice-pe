@@ -2,8 +2,8 @@ packages:
   device: !include ../../home-assistant-voice.yaml
 
 substitutions:
-  external_components_path: ../../esphome/components
-  sounds_path: ../../sounds
+  nova_gateway_url: ws://voice-gateway.invalid:8080/v1/device
+  nova_device_id: ci-validation-device
 
 wifi:
   ssid: ci-validation-network

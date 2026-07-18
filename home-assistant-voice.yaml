@@ -16,9 +16,11 @@ substitutions:
   voice_assist_error_phase_id: '11'
   # Change this to true in case you ahve a hidden SSID at home.
   hidden_ssid: "false"
-  # CI overrides this because its package overlay lives below the repository root.
-  external_components_path: esphome/components
-  sounds_path: sounds
+  # Remote-package defaults. The installing YAML should override the two NOVA
+  # values with local secrets (see README.md).
+  nova_gateway_url: ws://voice-gateway.invalid:8080/v1/device
+  nova_device_id: voice-pe-main
+  sounds_base_url: https://raw.githubusercontent.com/Denis-v-ops/home-assistant-voice-PE/dev/sounds
 
 esphome:
   name: home-assistant-voice
@@ -1315,39 +1317,39 @@ media_player:
               duration: 1.0s
     files:
       - id: center_button_press_sound
-        file: ${sounds_path}/center_button_press.flac
+        file: ${sounds_base_url}/center_button_press.flac
       - id: center_button_double_press_sound
-        file: ${sounds_path}/center_button_double_press.flac
+        file: ${sounds_base_url}/center_button_double_press.flac
       - id: center_button_triple_press_sound
-        file: ${sounds_path}/center_button_triple_press.flac
+        file: ${sounds_base_url}/center_button_triple_press.flac
       - id: center_button_long_press_sound
-        file: ${sounds_path}/center_button_long_press.flac
+        file: ${sounds_base_url}/center_button_long_press.flac
       - id: factory_reset_initiated_sound
-        file: ${sounds_path}/factory_reset_initiated.mp3
+        file: ${sounds_base_url}/factory_reset_initiated.mp3
       - id: factory_reset_cancelled_sound
-        file: ${sounds_path}/factory_reset_cancelled.mp3
+        file: ${sounds_base_url}/factory_reset_cancelled.mp3
       - id: factory_reset_confirmed_sound
-        file: ${sounds_path}/factory_reset_confirmed.mp3
+        file: ${sounds_base_url}/factory_reset_confirmed.mp3
       - id: jack_connected_sound
-        file: ${sounds_path}/jack_connected.flac
+        file: ${sounds_base_url}/jack_connected.flac
       - id: jack_disconnected_sound
-        file: ${sounds_path}/jack_disconnected.flac
+        file: ${sounds_base_url}/jack_disconnected.flac
       - id: mute_switch_on_sound
-        file: ${sounds_path}/mute_switch_on.flac
+        file: ${sounds_base_url}/mute_switch_on.flac
       - id: mute_switch_off_sound
-        file: ${sounds_path}/mute_switch_off.flac
+        file: ${sounds_base_url}/mute_switch_off.flac
       - id: easter_egg_tick_sound
-        file: ${sounds_path}/easter_egg_tick.mp3
+        file: ${sounds_base_url}/easter_egg_tick.mp3
       - id: easter_egg_tada_sound
-        file: ${sounds_path}/easter_egg_tada.mp3
+        file: ${sounds_base_url}/easter_egg_tada.mp3
       - id: nova_wake_1
-        file: ${sounds_path}/wake/1.flac
+        file: ${sounds_base_url}/wake/1.flac
       - id: nova_wake_2
-        file: ${sounds_path}/wake/2.flac
+        file: ${sounds_base_url}/wake/2.flac
       - id: nova_wake_3
-        file: ${sounds_path}/wake/3.flac
+        file: ${sounds_base_url}/wake/3.flac
       - id: nova_wake_4
-        file: ${sounds_path}/wake/4.flac
+        file: ${sounds_base_url}/wake/4.flac
 
 voice_kit:
   id: voice_kit_component
@@ -1359,9 +1361,8 @@ voice_kit:
     md5: 964635c5bf125529dab14a2472a15401
 
 external_components:
-  - source:
-      type: local
-      path: ${external_components_path}
+  - source: github://Denis-v-ops/home-assistant-voice-PE@dev
+    refresh: 5min
     components:
       - voice_kit
       - nova_realtime
@@ -1457,8 +1458,8 @@ nova_realtime:
     microphone: i2s_mics
     channels: 0
   speaker: realtime_resampling_speaker
-  gateway_url: !secret nova_gateway_url
-  device_id: !secret nova_device_id
+  gateway_url: ${nova_gateway_url}
+  device_id: ${nova_device_id}
   on_connected:
     - lambda: |-
         id(init_in_progress) = false;
