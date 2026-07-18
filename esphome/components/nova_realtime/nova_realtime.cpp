@@ -4,7 +4,6 @@
 #include <cstring>
 
 #include <ArduinoJson.h>
-#include <mbedtls/md.h>
 
 #include "esphome/components/network/util.h"
 #include "esphome/core/log.h"
@@ -37,7 +36,7 @@ void NovaRealtime::dump_config() {
   ESP_LOGCONFIG(TAG, "NOVA Realtime:");
   ESP_LOGCONFIG(TAG, "  Gateway: %s", this->gateway_url_.c_str());
   ESP_LOGCONFIG(TAG, "  Device ID: %s", this->device_id_.c_str());
-  ESP_LOGCONFIG(TAG, "  TLS CA configured: %s", YESNO(!this->ca_certificate_.empty()));
+  ESP_LOGCONFIG(TAG, "  Transport: trusted LAN WebSocket");
 }
 
 void NovaRealtime::loop() {
@@ -78,8 +77,6 @@ void NovaRealtime::loop() {
 void NovaRealtime::connect_() {
   esp_websocket_client_config_t config{};
   config.uri = this->gateway_url_.c_str();
-  if (!this->ca_certificate_.empty())
-    config.cert_pem = this->ca_certificate_.c_str();
   this->client_ = esp_websocket_client_init(&config);
   if (this->client_ == nullptr) {
     this->next_connect_at_ = millis() + 5000;
@@ -97,9 +94,9 @@ void NovaRealtime::connect_() {
 }
 
 void NovaRealtime::disconnect_() {
-  bool notify = this->authenticated_;
+  bool notify = this->gateway_ready_;
   this->socket_connected_ = false;
-  this->authenticated_ = false;
+  this->gateway_ready_ = false;
   if (this->session_active_) {
     this->session_active_ = false;
     this->microphone_->stop();
@@ -120,6 +117,10 @@ void NovaRealtime::handle_websocket_event_(int32_t event_id, esp_websocket_event
   if (event_id == WEBSOCKET_EVENT_CONNECTED) {
     this->socket_connected_ = true;
     ESP_LOGI(TAG, "Gateway socket connected");
+    LockGuard lock(this->incoming_mutex_);
+    static const char connected[] = "{\"type\":\"__socket.connected\"}";
+    this->incoming_.push_back({false, std::vector<uint8_t>(connected, connected + sizeof(connected) - 1)});
+    this->enable_loop_soon_any_context();
     return;
   }
   if (event_id == WEBSOCKET_EVENT_DISCONNECTED || event_id == WEBSOCKET_EVENT_CLOSED) {
@@ -166,20 +167,22 @@ void NovaRealtime::handle_control_(const std::string &payload) {
   std::string type = document["type"] | "";
   if (type == "__socket.disconnected") {
     this->disconnect_();
-  } else if (type == "auth.challenge") {
-    std::string challenge = document["challenge"] | "";
-    JsonDocument response;
-    response["type"] = "auth.response";
-    response["device_id"] = this->device_id_;
-    response["digest"] = this->authentication_digest_(challenge);
+  } else if (type == "__socket.connected") {
+    JsonDocument hello;
+    hello["type"] = "hello";
+    hello["protocol"] = 1;
+    hello["device_id"] = this->device_id_;
     std::string encoded;
-    serializeJson(response, encoded);
+    serializeJson(hello, encoded);
     this->send_control_(encoded);
-  } else if (type == "auth.ok") {
-    this->authenticated_ = true;
+  } else if (type == "hello.ack") {
+    if ((document["protocol"] | 0) != 1 || std::string(document["device_id"] | "") != this->device_id_) {
+      this->send_error_("protocol_mismatch", "Gateway hello acknowledgement did not match this device");
+      return;
+    }
+    this->gateway_ready_ = true;
     this->microphone_sequence_ = 0;
     this->microphone_sample_index_ = 0;
-    this->send_control_("{\"type\":\"hello\",\"protocol\":1}");
     this->connected_trigger_.trigger();
     this->set_state_("armed");
   } else if (type == "ping") {
@@ -287,7 +290,7 @@ void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
 }
 
 void NovaRealtime::process_microphone_() {
-  if (!this->authenticated_ || !this->session_active_ || !this->socket_connected_)
+  if (!this->gateway_ready_ || !this->session_active_ || !this->socket_connected_)
     return;
   uint8_t frame[MICROPHONE_FRAME_BYTES];
   {
@@ -302,7 +305,7 @@ void NovaRealtime::process_microphone_() {
 }
 
 void NovaRealtime::start_session(const std::string &wake_word) {
-  if (!this->authenticated_) {
+  if (!this->gateway_ready_) {
     this->send_error_("gateway_unavailable", "Realtime gateway is not connected");
     return;
   }
@@ -336,11 +339,11 @@ void NovaRealtime::stop_session(const std::string &reason) {
   this->microphone_->stop();
   this->speaker_->stop();
   this->current_item_id_.clear();
-  this->set_state_(this->authenticated_ ? "armed" : "offline");
+  this->set_state_(this->gateway_ready_ ? "armed" : "offline");
 }
 
 void NovaRealtime::report_played_(bool force) {
-  if (this->current_item_id_.empty() || !this->authenticated_)
+  if (this->current_item_id_.empty() || !this->gateway_ready_)
     return;
   uint32_t played = this->played_samples_.load(std::memory_order_relaxed);
   if (!force && played - this->last_reported_samples_ < PLAYED_REPORT_INTERVAL)
@@ -388,22 +391,6 @@ void NovaRealtime::send_error_(const std::string &code, const std::string &messa
 void NovaRealtime::set_state_(const std::string &phase) {
   ESP_LOGD(TAG, "State: %s", phase.c_str());
   this->state_trigger_.trigger(phase);
-}
-
-std::string NovaRealtime::authentication_digest_(const std::string &challenge) const {
-  const std::string material = "nova-v1\n" + challenge;
-  unsigned char digest[32];
-  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-  mbedtls_md_hmac(info, reinterpret_cast<const unsigned char *>(this->pre_shared_key_.data()),
-                  this->pre_shared_key_.size(), reinterpret_cast<const unsigned char *>(material.data()),
-                  material.size(), digest);
-  static const char hex[] = "0123456789abcdef";
-  std::string output(64, '0');
-  for (size_t index = 0; index < sizeof(digest); index++) {
-    output[index * 2] = hex[digest[index] >> 4];
-    output[index * 2 + 1] = hex[digest[index] & 0x0F];
-  }
-  return output;
 }
 
 }  // namespace esphome::nova_realtime

@@ -27,13 +27,11 @@ class NovaRealtime : public Component {
   void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
   void set_gateway_url(const std::string &url) { this->gateway_url_ = url; }
   void set_device_id(const std::string &device_id) { this->device_id_ = device_id; }
-  void set_pre_shared_key(const std::string &key) { this->pre_shared_key_ = key; }
-  void set_ca_certificate(const std::string &certificate) { this->ca_certificate_ = certificate; }
 
   void start_session(const std::string &wake_word);
   void stop_session(const std::string &reason = "device_request");
   bool is_running() const { return this->session_active_.load(); }
-  bool is_connected() const { return this->authenticated_.load(); }
+  bool is_connected() const { return this->gateway_ready_.load(); }
 
   Trigger<> *get_connected_trigger() { return &this->connected_trigger_; }
   Trigger<> *get_disconnected_trigger() { return &this->disconnected_trigger_; }
@@ -60,7 +58,6 @@ class NovaRealtime : public Component {
   void send_audio_(const uint8_t *pcm, size_t length);
   void send_error_(const std::string &code, const std::string &message);
   void set_state_(const std::string &phase);
-  std::string authentication_digest_(const std::string &challenge) const;
 
   microphone::MicrophoneSource *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
@@ -68,8 +65,6 @@ class NovaRealtime : public Component {
 
   std::string gateway_url_;
   std::string device_id_;
-  std::string pre_shared_key_;
-  std::string ca_certificate_;
 
   Mutex incoming_mutex_;
   std::deque<IncomingMessage> incoming_;
@@ -82,7 +77,7 @@ class NovaRealtime : public Component {
   size_t speaker_pending_offset_{0};
 
   std::atomic<bool> socket_connected_{false};
-  std::atomic<bool> authenticated_{false};
+  std::atomic<bool> gateway_ready_{false};
   std::atomic<bool> session_active_{false};
   std::atomic<bool> incoming_overrun_{false};
   uint32_t next_connect_at_{0};

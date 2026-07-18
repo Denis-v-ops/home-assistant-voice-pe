@@ -1,3 +1,5 @@
+import re
+
 from esphome import automation
 import esphome.codegen as cg
 from esphome.components import esp32, microphone, speaker
@@ -11,8 +13,6 @@ CODEOWNERS = []
 
 CONF_GATEWAY_URL = "gateway_url"
 CONF_DEVICE_ID = "device_id"
-CONF_PRE_SHARED_KEY = "pre_shared_key"
-CONF_CA_CERTIFICATE = "ca_certificate"
 CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_STATE = "on_state"
@@ -35,24 +35,17 @@ IsConnectedCondition = nova_ns.class_(
 )
 
 
-def _wss_url(value):
+def _lan_ws_url(value):
     value = cv.url(value)
-    if not value.startswith("wss://"):
-        raise cv.Invalid("NOVA gateway URL must use wss://")
+    if not value.startswith("ws://"):
+        raise cv.Invalid("NOVA trusted-LAN gateway URL must use ws://")
     return value
 
 
-def _device_key(value):
+def _device_id(value):
     value = cv.string_strict(value)
-    if len(value.encode("utf-8")) < 32:
-        raise cv.Invalid("NOVA device PSK must be at least 32 bytes")
-    return value
-
-
-def _ca_certificate(value):
-    value = cv.string(value)
-    if "-----BEGIN CERTIFICATE-----" not in value:
-        raise cv.Invalid("NOVA gateway CA must be a PEM certificate")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", value) is None:
+        raise cv.Invalid("NOVA device ID may contain letters, digits, dot, dash, and underscore")
     return value
 
 CONFIG_SCHEMA = cv.Schema(
@@ -65,10 +58,8 @@ CONFIG_SCHEMA = cv.Schema(
             max_channels=1,
         ),
         cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
-        cv.Required(CONF_GATEWAY_URL): _wss_url,
-        cv.Required(CONF_DEVICE_ID): cv.All(cv.string_strict, cv.Length(min=1, max=64)),
-        cv.Required(CONF_PRE_SHARED_KEY): _device_key,
-        cv.Required(CONF_CA_CERTIFICATE): _ca_certificate,
+        cv.Required(CONF_GATEWAY_URL): _lan_ws_url,
+        cv.Required(CONF_DEVICE_ID): _device_id,
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_STATE): automation.validate_automation(single=True),
@@ -100,8 +91,6 @@ async def to_code(config):
     cg.add(var.set_speaker(output))
     cg.add(var.set_gateway_url(config[CONF_GATEWAY_URL]))
     cg.add(var.set_device_id(config[CONF_DEVICE_ID]))
-    cg.add(var.set_pre_shared_key(config[CONF_PRE_SHARED_KEY]))
-    cg.add(var.set_ca_certificate(config[CONF_CA_CERTIFICATE]))
 
     if CONF_ON_CONNECTED in config:
         await automation.build_automation(var.get_connected_trigger(), [], config[CONF_ON_CONNECTED])
