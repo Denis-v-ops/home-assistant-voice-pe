@@ -89,6 +89,7 @@ class NovaRealtime : public Component {
   void run_tx_task_();
   void send_error_(const std::string &code, const std::string &message);
   void set_state_(const std::string &phase);
+  void set_microphone_streaming_(bool enabled);
   void stop_session_(const std::string &reason, bool error);
   void reset_session_(const std::string &phase);
   void acquire_wifi_performance_();
@@ -139,6 +140,7 @@ class NovaRealtime : public Component {
   std::atomic<bool> tx_transport_fault_{false};
   std::atomic<int8_t> socket_event_{0};
   std::atomic<bool> microphone_discontinuity_{false};
+  std::atomic<bool> microphone_streaming_{false};
   std::atomic<uint32_t> microphone_drops_pending_{0};
   std::atomic<uint32_t> played_samples_{0};
   std::atomic<uint32_t> microphone_callback_count_{0};

@@ -1213,6 +1213,20 @@ script:
             return files[esp_random() % n];
       - delay: 1000ms
 
+  # Wait until acoustic echo cancellation has settled before accepting the
+  # local stop word, matching the upstream Voice PE response lifecycle.
+  - id: activate_nova_stop_word_once
+    mode: restart
+    then:
+      - delay: 1s
+      - if:
+          condition:
+            and:
+              - nova_realtime.is_running:
+              - lambda: return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};
+          then:
+            - micro_wake_word.enable_model: stop
+
 i2s_audio:
   - id: i2s_output
     # i2s_output data pin is gpio10
@@ -1430,6 +1444,7 @@ micro_wake_word:
                                   switch.is_on: wake_sound
                                 then:
                                   - script.execute: play_random_wake
+                                  - delay: 300ms
                             - nova_realtime.start:
                                 wake_word: !lambda return wake_word;
 
@@ -1504,8 +1519,9 @@ nova_realtime:
         condition:
           lambda: return phase == "assistant_speaking";
         then:
-          - micro_wake_word.enable_model: stop
+          - script.execute: activate_nova_stop_word_once
         else:
+          - script.stop: activate_nova_stop_word_once
           - micro_wake_word.disable_model: stop
     - if:
         condition:

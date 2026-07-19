@@ -310,6 +310,11 @@ void NovaRealtime::handle_websocket_event_(int32_t event_id, esp_websocket_event
   if (event_id != WEBSOCKET_EVENT_DATA || event == nullptr || event->data_ptr == nullptr || event->data_len <= 0)
     return;
 
+  // ESP-IDF also reports WebSocket close/ping/pong control payloads through
+  // WEBSOCKET_EVENT_DATA. They are not application JSON messages.
+  if (event->payload_offset == 0 && event->op_code != 0x1 && event->op_code != 0x2)
+    return;
+
   if (event->payload_len <= 0 || static_cast<size_t>(event->payload_len) > MAX_MESSAGE_BYTES) {
     this->incoming_overrun_ = true;
     this->enable_loop_soon_any_context();
@@ -404,8 +409,13 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
       this->acquire_wifi_performance_();
       this->microphone_->start();
     }
-    if (this->session_matches_(session_id))
-      this->set_state_(document["phase"] | "unknown");
+    if (this->session_matches_(session_id)) {
+      const char *phase = document["phase"] | "unknown";
+      this->set_microphone_streaming_(std::strcmp(phase, "connecting") == 0 ||
+                                      std::strcmp(phase, "listening") == 0 ||
+                                      std::strcmp(phase, "user_speaking") == 0);
+      this->set_state_(phase);
+    }
   } else if (std::strcmp(type, "session.started") == 0) {
     if (!this->session_matches_(document["session_id"] | ""))
       return;
@@ -564,7 +574,7 @@ void NovaRealtime::process_finish_() {
 }
 
 void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
-  if (!this->session_active_ || data.empty() || this->microphone_buffer_ == nullptr)
+  if (!this->session_active_ || !this->microphone_streaming_ || data.empty() || this->microphone_buffer_ == nullptr)
     return;
   const uint32_t callback_count = this->microphone_callback_count_.fetch_add(1, std::memory_order_relaxed);
   if ((callback_count & 0x3FU) == 0) {
@@ -585,6 +595,10 @@ void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
     this->microphone_drops_pending_.fetch_add(1);
   }
   LockGuard lock(this->microphone_mutex_);
+  // The phase may have changed while this callback waited for the buffer.
+  // Avoid carrying one stale speaker-echo frame into the next listening phase.
+  if (!this->microphone_streaming_)
+    return;
   const size_t free_bytes = this->microphone_buffer_->free();
   if (free_bytes < length) {
     const size_t removed = length - free_bytes;
@@ -624,7 +638,8 @@ void NovaRealtime::run_tx_task_() {
       LockGuard lock(this->microphone_mutex_);
       microphone_ready = this->microphone_buffer_->available() >= MICROPHONE_FRAME_BYTES;
     }
-    if (this->gateway_ready_ && this->session_active_ && this->socket_connected_ && microphone_ready) {
+    if (this->gateway_ready_ && this->session_active_ && this->microphone_streaming_ && this->socket_connected_ &&
+        microphone_ready) {
       this->send_audio_from_task_();
       continue;
     }
@@ -635,6 +650,8 @@ void NovaRealtime::run_tx_task_() {
 }
 
 void NovaRealtime::send_audio_from_task_() {
+  if (!this->microphone_streaming_)
+    return;
   auto &frame = this->tx_audio_frame_;
   {
     LockGuard lock(this->microphone_mutex_);
@@ -720,6 +737,7 @@ void NovaRealtime::start_session(const std::string &wake_word) {
   this->microphone_callback_count_ = 0;
   this->microphone_callback_stack_low_water_bytes_ = 0xFFFFFFFFUL;
   this->session_stack_reported_ = false;
+  this->set_microphone_streaming_(true);
   this->acquire_wifi_performance_();
   JsonDocument request;
   request["type"] = "session.start";
@@ -755,6 +773,7 @@ void NovaRealtime::stop_session_(const std::string &reason, bool error) {
 void NovaRealtime::reset_session_(const std::string &phase) {
   this->session_active_ = false;
   this->session_state_ = SessionState::IDLE;
+  this->set_microphone_streaming_(false);
   if (this->microphone_ != nullptr)
     this->microphone_->stop();
   if (this->speaker_ != nullptr)
@@ -847,6 +866,17 @@ void NovaRealtime::send_pong_(uint64_t timestamp_ms) {
 void NovaRealtime::send_error_(const std::string &code, const std::string &message) {
   ESP_LOGW(TAG, "%s: %s", code.c_str(), message.c_str());
   this->error_trigger_.trigger(code, message);
+}
+
+void NovaRealtime::set_microphone_streaming_(bool enabled) {
+  if (this->microphone_streaming_.exchange(enabled) == enabled)
+    return;
+  if (!enabled && this->microphone_buffer_ != nullptr) {
+    LockGuard lock(this->microphone_mutex_);
+    this->microphone_buffer_->reset();
+  }
+  if (this->tx_task_handle_.is_created())
+    xTaskNotifyGive(this->tx_task_handle_.get_handle());
 }
 
 void NovaRealtime::set_state_(const std::string &phase) {
