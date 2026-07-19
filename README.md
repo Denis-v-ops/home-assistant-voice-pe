@@ -20,6 +20,7 @@ substitutions:
   nova_gateway_url: !secret nova_gateway_url
   nova_device_id: !secret nova_device_id
   nova_repo_ref: nova-v0.3.0
+  nova_components_refresh: 1d
 
 packages:
   nova_voice_pe:
@@ -32,7 +33,9 @@ packages:
 The package now loads `voice_kit` and `nova_realtime` itself. `nova-v0.3.0` is
 the immutable coordinated-release tag; publish it from the reviewed firmware
 commit before using this production wrapper. Pre-release CI overrides the
-component source and sound path with checked-out local files.
+component source and sound path with checked-out local files. Development
+packages force-refresh their component checkout so a newer YAML file cannot be
+compiled with a stale component implementing an older device protocol.
 
 The gateway URL ends in `/v2/device` and is a direct `ws://` LAN endpoint; this design assumes the
 gateway port is not forwarded or otherwise exposed outside the trusted home

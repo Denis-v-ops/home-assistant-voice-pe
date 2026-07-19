@@ -24,6 +24,9 @@ substitutions:
   # wrappers override the ref with the coordinated immutable tag.
   nova_repo_ref: dev
   nova_components_source: github://Denis-v-ops/home-assistant-voice-PE@${nova_repo_ref}
+  # The development branch changes in place. Never reuse a cached component
+  # checkout with a newer package because that can mix protocol versions.
+  nova_components_refresh: 0s
   sounds_base_url: https://raw.githubusercontent.com/Denis-v-ops/home-assistant-voice-PE/${nova_repo_ref}/sounds
 
 esphome:
@@ -1366,6 +1369,7 @@ voice_kit:
 
 external_components:
   - source: ${nova_components_source}
+    refresh: ${nova_components_refresh}
     components:
       - voice_kit
       - nova_realtime
