@@ -20,7 +20,11 @@ substitutions:
   # values with local secrets (see README.md).
   nova_gateway_url: ws://voice-gateway.invalid:8080/v2/device
   nova_device_id: voice-pe-main
-  sounds_base_url: https://raw.githubusercontent.com/Denis-v-ops/home-assistant-voice-PE/nova-v0.3.0/sounds
+  # Development defaults keep this remote package self-contained. Release
+  # wrappers override the ref with the coordinated immutable tag.
+  nova_repo_ref: dev
+  nova_components_source: github://Denis-v-ops/home-assistant-voice-PE@${nova_repo_ref}
+  sounds_base_url: https://raw.githubusercontent.com/Denis-v-ops/home-assistant-voice-PE/${nova_repo_ref}/sounds
 
 esphome:
   name: home-assistant-voice
@@ -1359,6 +1363,12 @@ voice_kit:
     url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
     version: "1.3.1"
     md5: 964635c5bf125529dab14a2472a15401
+
+external_components:
+  - source: ${nova_components_source}
+    components:
+      - voice_kit
+      - nova_realtime
 
 audio_dac:
   - platform: aic3204

@@ -19,6 +19,7 @@ then map them into the package from the device YAML:
 substitutions:
   nova_gateway_url: !secret nova_gateway_url
   nova_device_id: !secret nova_device_id
+  nova_repo_ref: nova-v0.3.0
 
 packages:
   nova_voice_pe:
@@ -26,16 +27,12 @@ packages:
     file: home-assistant-voice.yaml
     ref: nova-v0.3.0
 
-external_components:
-  - source: github://Denis-v-ops/home-assistant-voice-PE@nova-v0.3.0
-    components:
-      - voice_kit
-      - nova_realtime
 ```
 
-`nova-v0.3.0` is the immutable coordinated-release tag. Publish it from the
-reviewed firmware commit before using this production wrapper; pre-release CI
-uses the checked-out local component and sound files instead.
+The package now loads `voice_kit` and `nova_realtime` itself. `nova-v0.3.0` is
+the immutable coordinated-release tag; publish it from the reviewed firmware
+commit before using this production wrapper. Pre-release CI overrides the
+component source and sound path with checked-out local files.
 
 The gateway URL ends in `/v2/device` and is a direct `ws://` LAN endpoint; this design assumes the
 gateway port is not forwarded or otherwise exposed outside the trusted home
