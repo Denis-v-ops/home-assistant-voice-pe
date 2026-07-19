@@ -141,6 +141,8 @@ class NovaRealtime : public Component {
   std::atomic<bool> microphone_discontinuity_{false};
   std::atomic<uint32_t> microphone_drops_pending_{0};
   std::atomic<uint32_t> played_samples_{0};
+  std::atomic<uint32_t> microphone_callback_count_{0};
+  std::atomic<uint32_t> microphone_callback_stack_low_water_bytes_{0xFFFFFFFFUL};
 
   SessionState session_state_{SessionState::IDLE};
   uint32_t next_connect_at_{0};
@@ -171,6 +173,7 @@ class NovaRealtime : public Component {
   bool wifi_performance_owned_{false};
   bool enabled_{true};
   bool hello_pending_{false};
+  bool session_stack_reported_{false};
   std::string flush_item_id_;
   std::string current_session_id_;
   std::string current_item_id_;

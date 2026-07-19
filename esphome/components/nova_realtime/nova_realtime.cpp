@@ -25,10 +25,12 @@ static constexpr uint32_t FLUSH_QUIET_MS = 10;
 static constexpr uint32_t LOOP_BUDGET_US = 2000;
 static constexpr size_t LOOP_MESSAGE_BUDGET = 4;
 static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
-// StaticTask sizes are StackType_t words; 2048 words is 8 KiB on ESP32.
-static constexpr uint32_t TX_TASK_STACK_WORDS = 2048;
+// ESP-IDF defines StackType_t as uint8_t and its task stack depth in bytes.
+// Streaming enters the WebSocket send path from this task, so retain ample
+// headroom for ESP-IDF 5.5 call frames.
+static constexpr uint32_t TX_TASK_STACK_BYTES = 8192;
 // esp_websocket_client task_stack is expressed in bytes.
-static constexpr int WEBSOCKET_TASK_STACK_BYTES = 8192;
+static constexpr int WEBSOCKET_TASK_STACK_BYTES = 16384;
 
 static bool deadline_reached(uint32_t now, uint32_t deadline) { return static_cast<int32_t>(now - deadline) >= 0; }
 
@@ -67,7 +69,7 @@ void NovaRealtime::setup() {
   this->speaker_->add_audio_output_callback(
       [this](uint32_t frames, int64_t) { this->played_samples_.fetch_add(frames, std::memory_order_relaxed); });
 
-  if (!this->tx_task_handle_.create(NovaRealtime::tx_task_, "nova_tx", TX_TASK_STACK_WORDS, this, TX_TASK_PRIORITY,
+  if (!this->tx_task_handle_.create(NovaRealtime::tx_task_, "nova_tx", TX_TASK_STACK_BYTES, this, TX_TASK_PRIORITY,
                                      false)) {
     ESP_LOGE(TAG, "Could not create NOVA transmit task");
     this->mark_failed();
@@ -75,7 +77,7 @@ void NovaRealtime::setup() {
   }
   this->next_connect_at_ = millis() + this->connect_delay_ms_;
   ESP_LOGI(TAG, "NOVA transport initialized (TX stack: %u bytes, WebSocket stack: %d bytes)",
-           unsigned(TX_TASK_STACK_WORDS * sizeof(StackType_t)), WEBSOCKET_TASK_STACK_BYTES);
+           unsigned(TX_TASK_STACK_BYTES), WEBSOCKET_TASK_STACK_BYTES);
 }
 
 void NovaRealtime::dump_config() {
@@ -188,6 +190,16 @@ void NovaRealtime::loop() {
   this->process_flush_();
   this->process_finish_();
   this->report_played_();
+
+  const uint32_t microphone_stack_margin =
+      this->microphone_callback_stack_low_water_bytes_.load(std::memory_order_relaxed);
+  if (this->session_active_ && !this->session_stack_reported_ && microphone_stack_margin != 0xFFFFFFFFUL) {
+    const uint32_t tx_stack_margin =
+        uxTaskGetStackHighWaterMark(this->tx_task_handle_.get_handle());
+    ESP_LOGI(TAG, "Session stack margins - microphone callback: %" PRIu32 " bytes, TX: %" PRIu32 " bytes",
+             microphone_stack_margin, tx_stack_margin);
+    this->session_stack_reported_ = true;
+  }
 
   if (this->session_state_ == SessionState::STARTING && deadline_reached(now, this->session_start_deadline_)) {
     this->send_error_("session_start_timeout", "Gateway did not start the session in time");
@@ -554,6 +566,16 @@ void NovaRealtime::process_finish_() {
 void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
   if (!this->session_active_ || data.empty() || this->microphone_buffer_ == nullptr)
     return;
+  const uint32_t callback_count = this->microphone_callback_count_.fetch_add(1, std::memory_order_relaxed);
+  if ((callback_count & 0x3FU) == 0) {
+    const uint32_t stack_margin = uxTaskGetStackHighWaterMark(nullptr);
+    uint32_t observed_stack_margin =
+        this->microphone_callback_stack_low_water_bytes_.load(std::memory_order_relaxed);
+    while (stack_margin < observed_stack_margin &&
+           !this->microphone_callback_stack_low_water_bytes_.compare_exchange_weak(
+               observed_stack_margin, stack_margin, std::memory_order_relaxed)) {
+    }
+  }
   const uint8_t *source = data.data();
   size_t length = data.size();
   if (length > MICROPHONE_BUFFER_BYTES) {
@@ -563,16 +585,16 @@ void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
     this->microphone_drops_pending_.fetch_add(1);
   }
   LockGuard lock(this->microphone_mutex_);
-  std::array<uint8_t, MICROPHONE_FRAME_BYTES> discarded{};
-  while (this->microphone_buffer_->free() < length && this->microphone_buffer_->available() != 0) {
-    size_t removed = this->microphone_buffer_->read(
-        discarded.data(), std::min(discarded.size(), this->microphone_buffer_->available()), 0);
-    if (removed == 0)
-      break;
+  const size_t free_bytes = this->microphone_buffer_->free();
+  if (free_bytes < length) {
+    const size_t removed = length - free_bytes;
     this->microphone_discontinuity_ = true;
     this->microphone_drops_pending_.fetch_add((removed + MICROPHONE_FRAME_BYTES - 1) / MICROPHONE_FRAME_BYTES);
   }
-  this->microphone_buffer_->write_without_replacement(source, length, 0, false);
+  if (this->microphone_buffer_->write(source, length) != length) {
+    this->microphone_discontinuity_ = true;
+    this->microphone_drops_pending_.fetch_add(1);
+  }
   this->microphone_high_water_bytes_ =
       std::max<uint32_t>(this->microphone_high_water_bytes_, this->microphone_buffer_->available());
   if (this->tx_task_handle_.is_created())
@@ -695,6 +717,9 @@ void NovaRealtime::start_session(const std::string &wake_word) {
   this->microphone_discontinuity_ = false;
   this->microphone_drop_window_started_ = millis();
   this->microphone_drop_window_count_ = 0;
+  this->microphone_callback_count_ = 0;
+  this->microphone_callback_stack_low_water_bytes_ = 0xFFFFFFFFUL;
+  this->session_stack_reported_ = false;
   this->acquire_wifi_performance_();
   JsonDocument request;
   request["type"] = "session.start";
@@ -807,8 +832,12 @@ void NovaRealtime::send_pong_(uint64_t timestamp_ms) {
   diagnostics["reconnects"] = this->reconnect_count_.load(std::memory_order_relaxed);
   diagnostics["tx_stack_low_water_bytes"] =
       this->tx_task_handle_.is_created()
-          ? uxTaskGetStackHighWaterMark(this->tx_task_handle_.get_handle()) * sizeof(StackType_t)
+          ? uxTaskGetStackHighWaterMark(this->tx_task_handle_.get_handle())
           : 0;
+  const uint32_t microphone_stack_margin =
+      this->microphone_callback_stack_low_water_bytes_.load(std::memory_order_relaxed);
+  diagnostics["mic_stack_low_water_bytes"] =
+      microphone_stack_margin == 0xFFFFFFFFUL ? 0 : microphone_stack_margin;
   diagnostics["uptime_ms"] = millis();
   std::string encoded;
   serializeJson(pong, encoded);
