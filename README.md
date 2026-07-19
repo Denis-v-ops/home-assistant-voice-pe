@@ -41,6 +41,25 @@ The gateway URL ends in `/v2/device` and is a direct `ws://` LAN endpoint; this 
 gateway port is not forwarded or otherwise exposed outside the trusted home
 network.
 
+### Boot-loop recovery
+
+If a development build enters ESPHome safe mode, its OTA port remains
+available. Add this substitution to the installing YAML, clean the build files,
+and install wirelessly:
+
+```yaml
+substitutions:
+  nova_transport_enabled: "false"
+```
+
+The recovery build skips all NOVA transport allocation, task creation, and
+gateway networking while retaining Wi-Fi, API, logs, and OTA. After collecting
+the reset trace and applying a fix, remove the override and reinstall.
+
+Normal builds wait ten seconds before their first gateway connection so API
+logs can attach before transport startup. For a longer diagnostic window,
+override `nova_connect_delay_ms` with a value up to `60000`.
+
 The center button or a configured wake word starts NOVA; another wake-word/stop
 word or center-button press interrupts it. The device deliberately has no
 Assist or timer fallback.

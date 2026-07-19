@@ -33,6 +33,8 @@ class NovaRealtime : public Component {
   void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
   void set_gateway_url(const std::string &url) { this->gateway_url_ = url; }
   void set_device_id(const std::string &device_id) { this->device_id_ = device_id; }
+  void set_enabled(bool enabled) { this->enabled_ = enabled; }
+  void set_connect_delay_ms(uint32_t connect_delay_ms) { this->connect_delay_ms_ = connect_delay_ms; }
 
   void start_session(const std::string &wake_word);
   void stop_session(const std::string &reason = "device_request");
@@ -136,6 +138,7 @@ class NovaRealtime : public Component {
 
   SessionState session_state_{SessionState::IDLE};
   uint32_t next_connect_at_{0};
+  uint32_t connect_delay_ms_{10000};
   uint32_t session_start_deadline_{0};
   uint32_t microphone_sequence_{0};
   uint32_t microphone_sample_index_{0};
@@ -160,6 +163,7 @@ class NovaRealtime : public Component {
   uint32_t flush_last_played_samples_{0};
   uint32_t flush_quiet_since_{0};
   bool wifi_performance_owned_{false};
+  bool enabled_{true};
   bool hello_pending_{false};
   std::string flush_item_id_;
   std::string current_session_id_;

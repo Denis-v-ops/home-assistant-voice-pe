@@ -20,6 +20,11 @@ substitutions:
   # values with local secrets (see README.md).
   nova_gateway_url: ws://voice-gateway.invalid:8080/v2/device
   nova_device_id: voice-pe-main
+  # Set false in a recovery build to keep API/OTA available while completely
+  # bypassing NOVA transport allocation, task creation, and networking.
+  nova_transport_enabled: "true"
+  # Leave time for API log attachment before the first gateway connection.
+  nova_connect_delay_ms: "10000"
   # Development defaults keep this remote package self-contained. Release
   # wrappers override the ref with the coordinated immutable tag.
   nova_repo_ref: dev
@@ -1461,6 +1466,8 @@ select:
 
 nova_realtime:
   id: nova_rt
+  enabled: ${nova_transport_enabled}
+  connect_delay_ms: ${nova_connect_delay_ms}
   microphone:
     microphone: i2s_mics
     channels: 0

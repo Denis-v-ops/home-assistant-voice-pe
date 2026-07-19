@@ -42,6 +42,11 @@ static void write_be32(uint8_t *data, uint32_t value) {
 }
 
 void NovaRealtime::setup() {
+  if (!this->enabled_) {
+    ESP_LOGW(TAG, "NOVA transport disabled by configuration; API and OTA remain available");
+    return;
+  }
+  ESP_LOGI(TAG, "Initializing bounded NOVA transport");
   RAMAllocator<uint8_t> external_allocator(RAMAllocator<uint8_t>::ALLOC_EXTERNAL);
   this->incoming_storage_ = external_allocator.allocate(INCOMING_SLOTS * MAX_MESSAGE_BYTES);
   this->fragment_storage_ = external_allocator.allocate(MAX_MESSAGE_BYTES);
@@ -61,25 +66,32 @@ void NovaRealtime::setup() {
       [this](uint32_t frames, int64_t) { this->played_samples_.fetch_add(frames, std::memory_order_relaxed); });
 
   if (!this->tx_task_handle_.create(NovaRealtime::tx_task_, "nova_tx", TX_TASK_STACK_WORDS, this, TX_TASK_PRIORITY,
-                                    false)) {
+                                     false)) {
     ESP_LOGE(TAG, "Could not create NOVA transmit task");
     this->mark_failed();
+    return;
   }
+  this->next_connect_at_ = millis() + this->connect_delay_ms_;
+  ESP_LOGI(TAG, "NOVA transport initialized");
 }
 
 void NovaRealtime::dump_config() {
   ESP_LOGCONFIG(TAG,
                 "NOVA Realtime v2:\n"
+                "  Enabled: %s\n"
+                "  Initial connect delay: %" PRIu32 " ms\n"
                 "  Gateway: %s\n"
                 "  Device ID: %s\n"
                 "  Playback window: 300 ms\n"
                 "  Speaker buffer: 400 ms\n"
                 "  Microphone buffer: 500 ms\n"
                 "  Transport: trusted LAN WebSocket",
-                this->gateway_url_.c_str(), this->device_id_.c_str());
+                YESNO(this->enabled_), this->connect_delay_ms_, this->gateway_url_.c_str(), this->device_id_.c_str());
 }
 
 void NovaRealtime::on_shutdown() {
+  if (!this->enabled_)
+    return;
   this->reset_session_("offline");
   this->tx_stop_ = true;
   if (this->tx_task_handle_.is_created()) {
@@ -99,6 +111,8 @@ void NovaRealtime::on_shutdown() {
 }
 
 void NovaRealtime::loop() {
+  if (!this->enabled_ || this->is_failed())
+    return;
   const uint32_t loop_started = micros();
   const uint32_t now = millis();
   if (network::is_connected() && this->client_ == nullptr && deadline_reached(now, this->next_connect_at_)) {
@@ -182,6 +196,7 @@ void NovaRealtime::loop() {
 }
 
 void NovaRealtime::connect_() {
+  ESP_LOGI(TAG, "Connecting to NOVA gateway");
   esp_websocket_client_config_t config{};
   config.uri = this->gateway_url_.c_str();
   config.enable_close_reconnect = true;
@@ -656,6 +671,8 @@ void NovaRealtime::report_played_(bool force) {
 }
 
 void NovaRealtime::start_session(const std::string &wake_word) {
+  if (!this->enabled_)
+    return;
   if (!this->gateway_ready_) {
     this->send_error_("gateway_unavailable", "Realtime gateway is not connected");
     return;

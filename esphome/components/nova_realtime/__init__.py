@@ -13,6 +13,8 @@ CODEOWNERS = []
 
 CONF_GATEWAY_URL = "gateway_url"
 CONF_DEVICE_ID = "device_id"
+CONF_ENABLED = "enabled"
+CONF_CONNECT_DELAY_MS = "connect_delay_ms"
 CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_STATE = "on_state"
@@ -60,6 +62,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
         cv.Required(CONF_GATEWAY_URL): _lan_ws_url,
         cv.Required(CONF_DEVICE_ID): _device_id,
+        cv.Optional(CONF_ENABLED, default=True): cv.boolean,
+        cv.Optional(CONF_CONNECT_DELAY_MS, default=10_000): cv.int_range(
+            min=0, max=60_000
+        ),
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_STATE): automation.validate_automation(single=True),
@@ -96,6 +102,8 @@ async def to_code(config):
     cg.add(var.set_speaker(output))
     cg.add(var.set_gateway_url(config[CONF_GATEWAY_URL]))
     cg.add(var.set_device_id(config[CONF_DEVICE_ID]))
+    cg.add(var.set_enabled(config[CONF_ENABLED]))
+    cg.add(var.set_connect_delay_ms(config[CONF_CONNECT_DELAY_MS]))
 
     if CONF_ON_CONNECTED in config:
         await automation.build_automation(var.get_connected_trigger(), [], config[CONF_ON_CONNECTED])
