@@ -18,15 +18,15 @@ substitutions:
   hidden_ssid: "false"
   # Remote-package defaults. The installing YAML should override the two NOVA
   # values with local secrets (see README.md).
-  nova_gateway_url: ws://voice-gateway.invalid:8080/v1/device
+  nova_gateway_url: ws://voice-gateway.invalid:8080/v2/device
   nova_device_id: voice-pe-main
-  sounds_base_url: https://raw.githubusercontent.com/Denis-v-ops/home-assistant-voice-PE/dev/sounds
+  sounds_base_url: https://raw.githubusercontent.com/Denis-v-ops/home-assistant-voice-PE/nova-v0.3.0/sounds
 
 esphome:
   name: home-assistant-voice
   friendly_name: Home Assistant Voice
   name_add_mac_suffix: true
-  min_version: 2026.5.0
+  min_version: 2026.7.0
   on_boot:
     priority: 375
     then:
@@ -79,7 +79,7 @@ network:
   enable_ipv6: true
 
 logger:
-  level: DEBUG
+  level: INFO
   logs:
     sensor: WARN  # avoids logging debug sensor updates
 
@@ -1248,6 +1248,7 @@ speaker:
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
     num_channels: 2
+    task_stack_in_psram: true
     source_speakers:
       - id: announcement_mixing_input
         timeout: never
@@ -1255,23 +1256,22 @@ speaker:
         timeout: never
       - id: realtime_mixing_input
         timeout: never
+        buffer_duration: 300ms
 
   # Vritual speakers to resample each pipelines' audio, if necessary, as the mixer speaker requires the same sample rate
   - platform: resampler
     id: announcement_resampling_speaker
     output_speaker: announcement_mixing_input
     sample_rate: 48000
-    bits_per_sample: 16
   - platform: resampler
     id: media_resampling_speaker
     output_speaker: media_mixing_input
     sample_rate: 48000
-    bits_per_sample: 16
   - platform: resampler
     id: realtime_resampling_speaker
     output_speaker: realtime_mixing_input
     sample_rate: 48000
-    bits_per_sample: 16
+    buffer_duration: 300ms
 
 media_player:
   - platform: speaker
@@ -1359,13 +1359,6 @@ voice_kit:
     url: https://github.com/esphome/voice-kit-xmos-firmware/releases/download/v1.3.1/ffva_v1.3.1_upgrade.bin
     version: "1.3.1"
     md5: 964635c5bf125529dab14a2472a15401
-
-external_components:
-  - source: github://Denis-v-ops/home-assistant-voice-PE@dev
-    refresh: 5min
-    components:
-      - voice_kit
-      - nova_realtime
 
 audio_dac:
   - platform: aic3204
@@ -1528,4 +1521,4 @@ button:
     icon: "mdi:restart"
 
 debug:
-  update_interval: 5s
+  update_interval: 30s

@@ -2,9 +2,19 @@ packages:
   device: !include ../../home-assistant-voice.yaml
 
 substitutions:
-  nova_gateway_url: ws://voice-gateway.invalid:8080/v1/device
+  nova_gateway_url: ws://voice-gateway.invalid:8080/v2/device
   nova_device_id: ci-validation-device
+  sounds_base_url: ../../sounds
 
 wifi:
   ssid: ci-validation-network
   password: ci-validation-password
+
+# Compile the checked-out component instead of silently fetching origin/dev.
+external_components:
+  - source:
+      type: local
+      path: ../../esphome/components
+    components:
+      - voice_kit
+      - nova_realtime

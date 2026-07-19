@@ -1,22 +1,38 @@
 #include "nova_realtime.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>
 
 #include "esphome/components/network/util.h"
+#include "esphome/components/wifi/wifi_component.h"
 #include "esphome/core/log.h"
 
 namespace esphome::nova_realtime {
 
 static const char *const TAG = "nova_realtime";
 static constexpr size_t PROTOCOL_HEADER_SIZE = 16;
-static constexpr size_t MICROPHONE_FRAME_BYTES = 640;  // 20 ms, 16 kHz, mono PCM16
-static constexpr size_t MAX_MICROPHONE_BUFFER = 16000;  // 500 ms startup prebuffer
-static constexpr size_t MAX_INCOMING_MESSAGES = 32;
-static constexpr size_t MAX_SPEAKER_BUFFER = 96000;  // two seconds at 24 kHz PCM16
-static constexpr uint32_t PLAYED_REPORT_INTERVAL = 2400;  // 100 ms at 24 kHz
+static constexpr size_t MICROPHONE_BUFFER_BYTES = 16000;
+static constexpr size_t SPEAKER_BUFFER_BYTES = 19200;
+static constexpr uint32_t PLAYED_REPORT_INTERVAL = 960;
+static constexpr uint32_t SESSION_START_TIMEOUT_MS = 20000;
+static constexpr uint32_t MICROPHONE_DROP_WINDOW_MS = 5000;
+static constexpr uint32_t MICROPHONE_DROP_LIMIT = 25;
+static constexpr uint32_t FLUSH_QUIET_MS = 10;
+static constexpr uint32_t LOOP_BUDGET_US = 2000;
+static constexpr size_t LOOP_MESSAGE_BUDGET = 4;
+static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
+static constexpr uint32_t TX_TASK_STACK_WORDS = 1024;
+
+static bool deadline_reached(uint32_t now, uint32_t deadline) { return static_cast<int32_t>(now - deadline) >= 0; }
+
+static uint32_t read_be32(const uint8_t *data) {
+  return (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) | (uint32_t(data[2]) << 8) | uint32_t(data[3]);
+}
 
 static void write_be32(uint8_t *data, uint32_t value) {
   data[0] = uint8_t(value >> 24);
@@ -26,57 +42,158 @@ static void write_be32(uint8_t *data, uint32_t value) {
 }
 
 void NovaRealtime::setup() {
+  RAMAllocator<uint8_t> external_allocator(RAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  this->incoming_storage_ = external_allocator.allocate(INCOMING_SLOTS * MAX_MESSAGE_BYTES);
+  this->fragment_storage_ = external_allocator.allocate(MAX_MESSAGE_BYTES);
+  this->microphone_buffer_ = ring_buffer::RingBuffer::create(MICROPHONE_BUFFER_BYTES);
+  this->speaker_buffer_ = ring_buffer::RingBuffer::create(SPEAKER_BUFFER_BYTES);
+  this->control_queue_ = xQueueCreate(OUTGOING_CONTROL_SLOTS, sizeof(OutgoingControl));
+  if (this->incoming_storage_ == nullptr || this->fragment_storage_ == nullptr || this->microphone_buffer_ == nullptr ||
+      this->speaker_buffer_ == nullptr || this->control_queue_ == nullptr) {
+    ESP_LOGE(TAG, "Could not allocate bounded NOVA transport buffers");
+    this->mark_failed();
+    return;
+  }
+
   this->microphone_->add_data_callback(
       [this](const std::vector<uint8_t> &data) { this->handle_microphone_data_(data); });
   this->speaker_->add_audio_output_callback(
       [this](uint32_t frames, int64_t) { this->played_samples_.fetch_add(frames, std::memory_order_relaxed); });
+
+  if (!this->tx_task_handle_.create(NovaRealtime::tx_task_, "nova_tx", TX_TASK_STACK_WORDS, this, TX_TASK_PRIORITY,
+                                    false)) {
+    ESP_LOGE(TAG, "Could not create NOVA transmit task");
+    this->mark_failed();
+  }
 }
 
 void NovaRealtime::dump_config() {
-  ESP_LOGCONFIG(TAG, "NOVA Realtime:");
-  ESP_LOGCONFIG(TAG, "  Gateway: %s", this->gateway_url_.c_str());
-  ESP_LOGCONFIG(TAG, "  Device ID: %s", this->device_id_.c_str());
-  ESP_LOGCONFIG(TAG, "  Transport: trusted LAN WebSocket");
+  ESP_LOGCONFIG(TAG,
+                "NOVA Realtime v2:\n"
+                "  Gateway: %s\n"
+                "  Device ID: %s\n"
+                "  Playback window: 300 ms\n"
+                "  Speaker buffer: 400 ms\n"
+                "  Microphone buffer: 500 ms\n"
+                "  Transport: trusted LAN WebSocket",
+                this->gateway_url_.c_str(), this->device_id_.c_str());
+}
+
+void NovaRealtime::on_shutdown() {
+  this->reset_session_("offline");
+  this->tx_stop_ = true;
+  if (this->tx_task_handle_.is_created()) {
+    xTaskNotifyGive(this->tx_task_handle_.get_handle());
+    this->tx_task_handle_.deallocate();
+  }
+  this->destroy_client_();
+  if (this->control_queue_ != nullptr) {
+    vQueueDelete(this->control_queue_);
+    this->control_queue_ = nullptr;
+  }
+  RAMAllocator<uint8_t> external_allocator(RAMAllocator<uint8_t>::ALLOC_EXTERNAL);
+  external_allocator.deallocate(this->incoming_storage_, INCOMING_SLOTS * MAX_MESSAGE_BYTES);
+  external_allocator.deallocate(this->fragment_storage_, MAX_MESSAGE_BYTES);
+  this->incoming_storage_ = nullptr;
+  this->fragment_storage_ = nullptr;
 }
 
 void NovaRealtime::loop() {
-  if (network::is_connected() && this->client_ == nullptr && millis() >= this->next_connect_at_) {
+  const uint32_t loop_started = micros();
+  const uint32_t now = millis();
+  if (network::is_connected() && this->client_ == nullptr && deadline_reached(now, this->next_connect_at_)) {
     this->connect_();
   }
+  this->process_socket_event_();
 
   if (this->incoming_overrun_.exchange(false)) {
     {
       LockGuard lock(this->incoming_mutex_);
-      this->incoming_.clear();
+      this->incoming_head_ = this->incoming_tail_ = this->incoming_count_ = 0;
     }
     this->send_error_("incoming_overrun", "Gateway receive queue exceeded its safe bound");
-    this->stop_session("incoming_overrun");
+    this->stop_session_("incoming_overrun", true);
+  }
+  if (this->control_overrun_.exchange(false)) {
+    this->send_error_("control_overrun", "Gateway transmit control queue exceeded its safe bound");
+    this->stop_session_("control_overrun", true);
+  }
+  if (this->tx_transport_fault_.exchange(false)) {
+    this->transport_faults_total_++;
+    this->send_error_("transport_send_failed", "Gateway transport send failed");
+    this->destroy_client_();
+    this->next_connect_at_ = now + 5000;
+    if (this->session_state_ != SessionState::IDLE)
+      this->stop_session_("transport_send_failed", true);
+    else
+      this->reset_session_("offline");
   }
 
-  while (true) {
+  uint32_t pending_drops = this->microphone_drops_pending_.exchange(0);
+  if (pending_drops != 0) {
+    if (this->microphone_drop_window_started_ == 0 ||
+        now - this->microphone_drop_window_started_ > MICROPHONE_DROP_WINDOW_MS) {
+      this->microphone_drop_window_started_ = now;
+      this->microphone_drop_window_count_ = 0;
+    }
+    this->microphone_drop_window_count_ += pending_drops;
+    this->microphone_drops_total_ += pending_drops;
+    if (this->microphone_drop_window_count_ >= MICROPHONE_DROP_LIMIT) {
+      this->stop_session_("microphone_backpressure", true);
+    }
+  }
+
+  size_t processed = 0;
+  while (processed < LOOP_MESSAGE_BUDGET && micros() - loop_started < LOOP_BUDGET_US) {
     IncomingMessage message;
+    const uint8_t *payload = nullptr;
     {
       LockGuard lock(this->incoming_mutex_);
-      if (this->incoming_.empty())
+      if (this->incoming_count_ == 0)
         break;
-      message = std::move(this->incoming_.front());
-      this->incoming_.pop_front();
+      message = this->incoming_messages_[this->incoming_head_];
+      payload = this->incoming_storage_ + this->incoming_head_ * MAX_MESSAGE_BYTES;
     }
     if (message.binary) {
-      this->handle_audio_(message.data);
+      this->handle_audio_(payload, message.length);
     } else {
-      this->handle_control_(std::string(message.data.begin(), message.data.end()));
+      this->handle_control_(payload, message.length);
     }
+    {
+      LockGuard lock(this->incoming_mutex_);
+      this->incoming_head_ = (this->incoming_head_ + 1) % INCOMING_SLOTS;
+      this->incoming_count_--;
+    }
+    processed++;
   }
 
   this->process_speaker_();
-  this->process_microphone_();
+  this->process_flush_();
+  this->process_finish_();
   this->report_played_();
+
+  if (this->session_state_ == SessionState::STARTING && deadline_reached(now, this->session_start_deadline_)) {
+    this->send_error_("session_start_timeout", "Gateway did not start the session in time");
+    this->stop_session_("session_start_timeout", true);
+  }
+
+  const uint32_t elapsed = micros() - loop_started;
+  this->max_loop_us_ = std::max(this->max_loop_us_, elapsed);
 }
 
 void NovaRealtime::connect_() {
   esp_websocket_client_config_t config{};
   config.uri = this->gateway_url_.c_str();
+  config.enable_close_reconnect = true;
+  config.reconnect_timeout_ms = 5000;
+  config.network_timeout_ms = 5000;
+  config.ping_interval_sec = 10;
+  config.keep_alive_enable = true;
+  config.keep_alive_idle = 5;
+  config.keep_alive_interval = 5;
+  config.keep_alive_count = 3;
+  config.buffer_size = MAX_MESSAGE_BYTES;
+  config.task_core_id_set = false;
   this->client_ = esp_websocket_client_init(&config);
   if (this->client_ == nullptr) {
     this->next_connect_at_ = millis() + 5000;
@@ -87,23 +204,31 @@ void NovaRealtime::connect_() {
   esp_err_t result = esp_websocket_client_start(this->client_);
   if (result != ESP_OK) {
     ESP_LOGW(TAG, "Gateway connection start failed: %s", esp_err_to_name(result));
-    esp_websocket_client_destroy(this->client_);
-    this->client_ = nullptr;
+    this->destroy_client_();
     this->next_connect_at_ = millis() + 5000;
   }
 }
 
-void NovaRealtime::disconnect_() {
-  bool notify = this->gateway_ready_;
+void NovaRealtime::destroy_client_() {
+  if (this->client_ == nullptr)
+    return;
+  esp_websocket_client_stop(this->client_);
+  esp_websocket_client_destroy(this->client_);
+  this->client_ = nullptr;
   this->socket_connected_ = false;
   this->gateway_ready_ = false;
-  if (this->session_active_) {
-    this->session_active_ = false;
-    this->microphone_->stop();
-    this->speaker_->stop();
-    this->current_item_id_.clear();
-    this->set_state_("offline");
+}
+
+void NovaRealtime::disconnect_() {
+  const bool notify = this->gateway_ready_.exchange(false);
+  this->socket_connected_ = false;
+  if (this->control_queue_ != nullptr)
+    xQueueReset(this->control_queue_);
+  {
+    LockGuard lock(this->incoming_mutex_);
+    this->incoming_head_ = this->incoming_tail_ = this->incoming_count_ = 0;
   }
+  this->reset_session_("offline");
   if (notify)
     this->disconnected_trigger_.trigger();
 }
@@ -113,21 +238,37 @@ void NovaRealtime::websocket_event_handler_(void *handler_args, esp_event_base_t
       event_id, static_cast<esp_websocket_event_data_t *>(event_data));
 }
 
+bool NovaRealtime::enqueue_message_(bool binary, const uint8_t *data, size_t length) {
+  if (length == 0 || length > MAX_MESSAGE_BYTES)
+    return false;
+  LockGuard lock(this->incoming_mutex_);
+  if (this->incoming_count_ >= INCOMING_SLOTS) {
+    this->incoming_overrun_ = true;
+    return false;
+  }
+  std::memcpy(this->incoming_storage_ + this->incoming_tail_ * MAX_MESSAGE_BYTES, data, length);
+  this->incoming_messages_[this->incoming_tail_] = {binary, static_cast<uint16_t>(length)};
+  this->incoming_tail_ = (this->incoming_tail_ + 1) % INCOMING_SLOTS;
+  this->incoming_count_++;
+  this->rx_high_water_bytes_ = std::max<uint32_t>(this->rx_high_water_bytes_, this->incoming_count_ * MAX_MESSAGE_BYTES);
+  this->enable_loop_soon_any_context();
+  return true;
+}
+
 void NovaRealtime::handle_websocket_event_(int32_t event_id, esp_websocket_event_data_t *event) {
   if (event_id == WEBSOCKET_EVENT_CONNECTED) {
-    this->socket_connected_ = true;
+    // The main loop publishes the connection only after stale session/control
+    // state has been purged, so the TX task cannot precede the new hello.
+    this->socket_connected_ = false;
+    this->reconnect_count_.fetch_add(1, std::memory_order_relaxed);
     ESP_LOGI(TAG, "Gateway socket connected");
-    LockGuard lock(this->incoming_mutex_);
-    static const char connected[] = "{\"type\":\"__socket.connected\"}";
-    this->incoming_.push_back({false, std::vector<uint8_t>(connected, connected + sizeof(connected) - 1)});
+    this->socket_event_ = 1;
     this->enable_loop_soon_any_context();
     return;
   }
   if (event_id == WEBSOCKET_EVENT_DISCONNECTED || event_id == WEBSOCKET_EVENT_CLOSED) {
     this->socket_connected_ = false;
-    LockGuard lock(this->incoming_mutex_);
-    static const char disconnected[] = "{\"type\":\"__socket.disconnected\"}";
-    this->incoming_.push_back({false, std::vector<uint8_t>(disconnected, disconnected + sizeof(disconnected) - 1)});
+    this->socket_event_ = -1;
     this->enable_loop_soon_any_context();
     return;
   }
@@ -138,170 +279,380 @@ void NovaRealtime::handle_websocket_event_(int32_t event_id, esp_websocket_event
   if (event_id != WEBSOCKET_EVENT_DATA || event == nullptr || event->data_ptr == nullptr || event->data_len <= 0)
     return;
 
-  LockGuard lock(this->incoming_mutex_);
-  if (event->payload_offset == 0) {
-    this->fragmented_message_.clear();
-    this->fragmented_message_.reserve(event->payload_len);
-    this->fragmented_binary_ = event->op_code == 0x2;
-  }
-  const auto *begin = reinterpret_cast<const uint8_t *>(event->data_ptr);
-  this->fragmented_message_.insert(this->fragmented_message_.end(), begin, begin + event->data_len);
-  if (event->payload_offset + event->data_len >= event->payload_len) {
-    if (this->incoming_.size() >= MAX_INCOMING_MESSAGES) {
-      this->incoming_overrun_ = true;
-    } else {
-      this->incoming_.push_back({this->fragmented_binary_, std::move(this->fragmented_message_)});
-    }
-    this->fragmented_message_.clear();
+  if (event->payload_len <= 0 || static_cast<size_t>(event->payload_len) > MAX_MESSAGE_BYTES) {
+    this->incoming_overrun_ = true;
     this->enable_loop_soon_any_context();
+    return;
+  }
+  if (event->payload_offset == 0) {
+    this->fragment_length_ = 0;
+    this->fragment_expected_ = event->payload_len;
+    this->fragment_binary_ = event->op_code == 0x2;
+  }
+  if (this->fragment_expected_ != static_cast<size_t>(event->payload_len) ||
+      this->fragment_length_ + event->data_len > MAX_MESSAGE_BYTES ||
+      static_cast<size_t>(event->payload_offset) != this->fragment_length_) {
+    this->incoming_overrun_ = true;
+    this->enable_loop_soon_any_context();
+    return;
+  }
+  std::memcpy(this->fragment_storage_ + this->fragment_length_, event->data_ptr, event->data_len);
+  this->fragment_length_ += event->data_len;
+  if (this->fragment_length_ == this->fragment_expected_) {
+    this->enqueue_message_(this->fragment_binary_, this->fragment_storage_, this->fragment_length_);
+    this->fragment_length_ = this->fragment_expected_ = 0;
   }
 }
 
-void NovaRealtime::handle_control_(const std::string &payload) {
+void NovaRealtime::process_socket_event_() {
+  const int8_t event = this->socket_event_.exchange(0);
+  if (event < 0) {
+    this->hello_pending_ = false;
+    this->disconnect_();
+    return;
+  }
+  if (event > 0) {
+    this->disconnect_();
+    this->socket_connected_ = true;
+    this->hello_pending_ = true;
+  }
+  if (this->hello_pending_ && this->socket_connected_ && this->queue_hello_())
+    this->hello_pending_ = false;
+}
+
+bool NovaRealtime::queue_hello_() {
+  JsonDocument hello;
+  hello["type"] = "hello";
+  hello["protocol"] = 2;
+  hello["device_id"] = this->device_id_;
+  char boot_id[9];
+  std::snprintf(boot_id, sizeof(boot_id), "%08" PRIx32, esp_random());
+  hello["boot_id"] = boot_id;
+  hello["output_flow"]["mode"] = "played_window";
+  hello["output_flow"]["max_inflight_samples"] = 7200;
+  hello["output_flow"]["played_report_interval_samples"] = PLAYED_REPORT_INTERVAL;
+  std::string encoded;
+  serializeJson(hello, encoded);
+  return this->queue_control_(encoded);
+}
+
+bool NovaRealtime::session_matches_(const char *session_id) const {
+  return session_id != nullptr && !this->current_session_id_.empty() && this->current_session_id_ == session_id;
+}
+
+void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
   JsonDocument document;
-  DeserializationError error = deserializeJson(document, payload);
+  DeserializationError error = deserializeJson(document, payload, length);
   if (error) {
     this->send_error_("invalid_gateway_message", error.c_str());
     return;
   }
-  std::string type = document["type"] | "";
-  if (type == "__socket.disconnected") {
-    this->disconnect_();
-  } else if (type == "__socket.connected") {
-    JsonDocument hello;
-    hello["type"] = "hello";
-    hello["protocol"] = 1;
-    hello["device_id"] = this->device_id_;
-    std::string encoded;
-    serializeJson(hello, encoded);
-    this->send_control_(encoded);
-  } else if (type == "hello.ack") {
-    if ((document["protocol"] | 0) != 1 || std::string(document["device_id"] | "") != this->device_id_) {
+  const char *type = document["type"] | "";
+  if (std::strcmp(type, "hello.ack") == 0) {
+    if ((document["protocol"] | 0) != 2 || std::string(document["device_id"] | "") != this->device_id_ ||
+        std::string(document["output_flow"]["mode"] | "") != "played_window") {
       this->send_error_("protocol_mismatch", "Gateway hello acknowledgement did not match this device");
       return;
     }
     this->gateway_ready_ = true;
     this->microphone_sequence_ = 0;
     this->microphone_sample_index_ = 0;
+    this->expected_speaker_sequence_ = 0;
+    this->speaker_sequence_initialized_ = false;
     this->connected_trigger_.trigger();
     this->set_state_("armed");
-  } else if (type == "ping") {
-    this->send_control_("{\"type\":\"pong\"}");
-  } else if (type == "session.started") {
+  } else if (std::strcmp(type, "ping") == 0) {
+    this->send_pong_(document["timestamp_ms"] | uint64_t(0));
+  } else if (std::strcmp(type, "state") == 0) {
+    const char *session_id = document["session_id"] | "";
+    if (this->current_session_id_.empty()) {
+      this->current_session_id_ = session_id;
+      this->session_state_ = SessionState::STARTING;
+      this->session_active_ = true;
+      this->session_start_deadline_ = millis() + SESSION_START_TIMEOUT_MS;
+      this->acquire_wifi_performance_();
+      this->microphone_->start();
+    }
+    if (this->session_matches_(session_id))
+      this->set_state_(document["phase"] | "unknown");
+  } else if (std::strcmp(type, "session.started") == 0) {
+    if (!this->session_matches_(document["session_id"] | ""))
+      return;
+    this->session_state_ = SessionState::ACTIVE;
     this->session_active_ = true;
-  } else if (type == "session.ended") {
-    this->report_played_(true);
-    this->session_active_ = false;
-    this->microphone_->stop();
-    this->speaker_->stop();
-    this->current_item_id_.clear();
-    this->set_state_("armed");
-  } else if (type == "state") {
-    this->set_state_(document["phase"] | "unknown");
-  } else if (type == "audio.begin") {
-    std::string next_item_id = document["item_id"] | "";
+  } else if (std::strcmp(type, "session.ended") == 0) {
+    if (this->session_matches_(document["session_id"] | ""))
+      this->reset_session_(this->gateway_ready_ ? "armed" : "offline");
+  } else if (std::strcmp(type, "audio.begin") == 0) {
+    if (!this->session_matches_(document["session_id"] | ""))
+      return;
+    const std::string next_item_id = document["item_id"] | "";
+    if (next_item_id.empty()) {
+      this->stop_session_("invalid_item", true);
+      return;
+    }
     if (!this->current_item_id_.empty() && this->current_item_id_ != next_item_id)
       this->speaker_->stop();
-    this->current_item_id_ = std::move(next_item_id);
-    this->played_samples_.store(0, std::memory_order_relaxed);
+    this->speaker_buffer_->reset();
+    this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
+    this->current_item_id_ = next_item_id;
+    this->played_samples_ = 0;
     this->last_reported_samples_ = 0;
-    this->speaker_pending_.clear();
-    this->speaker_pending_offset_ = 0;
+    this->expected_speaker_sample_index_ = 0;
+    this->total_speaker_samples_ = 0;
+    this->finish_requested_ = this->finish_called_ = this->drained_reported_ = false;
+    this->flush_requested_ = false;
+    this->flush_item_id_.clear();
     this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, 24000));
     this->speaker_->start();
-  } else if (type == "audio.end") {
-    this->report_played_(true);
-    this->speaker_->finish();
-  } else if (type == "audio.flush") {
-    std::string item_id = document["item_id"] | this->current_item_id_;
-    this->speaker_pending_.clear();
-    this->speaker_pending_offset_ = 0;
+  } else if (std::strcmp(type, "audio.end") == 0) {
+    if (!this->session_matches_(document["session_id"] | "") ||
+        this->current_item_id_ != std::string(document["item_id"] | "") || this->flush_requested_)
+      return;
+    const uint32_t total = document["total_samples"] | uint32_t(0);
+    if (total != this->expected_speaker_sample_index_) {
+      this->stop_session_("speaker_sample_mismatch", true);
+      return;
+    }
+    this->total_speaker_samples_ = total;
+    this->finish_requested_ = true;
+  } else if (std::strcmp(type, "audio.flush") == 0) {
+    if (!this->session_matches_(document["session_id"] | "") ||
+        this->current_item_id_ != std::string(document["item_id"] | ""))
+      return;
+    const std::string item_id = this->current_item_id_;
+    this->speaker_buffer_->reset();
+    this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
     this->speaker_->stop();
-    JsonDocument response;
-    response["type"] = "audio.flushed";
-    response["item_id"] = item_id;
-    response["played_samples"] = this->played_samples_.load(std::memory_order_relaxed);
-    std::string encoded;
-    serializeJson(response, encoded);
-    this->send_control_(encoded);
-    this->current_item_id_.clear();
-  } else if (type == "error") {
-    this->send_error_(document["code"] | "gateway_error", document["message"] | "Gateway error");
-    if (this->session_active_) {
-      this->session_active_ = false;
-      this->microphone_->stop();
-      this->speaker_->stop();
+    this->flush_requested_ = true;
+    this->flush_item_id_ = item_id;
+    this->flush_last_played_samples_ = this->played_samples_.load(std::memory_order_relaxed);
+    this->flush_quiet_since_ = millis();
+    this->finish_requested_ = this->finish_called_ = false;
+  } else if (std::strcmp(type, "error") == 0) {
+    const char *session_id = document["session_id"] | "";
+    if (*session_id == '\0' || this->session_matches_(session_id)) {
+      this->send_error_(document["code"] | "gateway_error", document["message"] | "Gateway error");
+      this->reset_session_(this->gateway_ready_ ? "armed" : "offline");
     }
   }
 }
 
-void NovaRealtime::handle_audio_(const std::vector<uint8_t> &payload) {
-  if (payload.size() < PROTOCOL_HEADER_SIZE || payload.size() > 2048 ||
-      std::memcmp(payload.data(), "NVR1", 4) != 0 || payload[4] != 1 || payload[5] != 2 ||
-      ((payload.size() - PROTOCOL_HEADER_SIZE) & 1) != 0) {
-    this->send_error_("invalid_audio_frame", "Rejected malformed speaker frame");
+void NovaRealtime::handle_audio_(const uint8_t *payload, size_t length) {
+  if (length < PROTOCOL_HEADER_SIZE || length > MAX_MESSAGE_BYTES || std::memcmp(payload, "NVR2", 4) != 0 ||
+      payload[4] != 2 || payload[5] != 2 || payload[6] != 0 || payload[7] != 0 ||
+      ((length - PROTOCOL_HEADER_SIZE) & 1) != 0) {
+    this->stop_session_("invalid_audio_frame", true);
     return;
   }
-  if (this->current_item_id_.empty())
+  if (this->current_item_id_.empty() || this->flush_requested_)
     return;
-  const size_t pcm_size = payload.size() - PROTOCOL_HEADER_SIZE;
-  const size_t pending_size = this->speaker_pending_.size() - this->speaker_pending_offset_;
-  if (pending_size + pcm_size > MAX_SPEAKER_BUFFER) {
-    this->send_error_("speaker_overrun", "Speaker buffer exceeded two seconds");
-    this->stop_session("speaker_overrun");
+  const uint32_t sequence = read_be32(payload + 8);
+  const uint32_t sample_index = read_be32(payload + 12);
+  if ((!this->speaker_sequence_initialized_ && sequence != 0) ||
+      (this->speaker_sequence_initialized_ && sequence != this->expected_speaker_sequence_) ||
+      sample_index != this->expected_speaker_sample_index_) {
+    this->stop_session_("speaker_sequence_discontinuity", true);
     return;
   }
-  if (this->speaker_pending_offset_ > 0) {
-    this->speaker_pending_.erase(this->speaker_pending_.begin(),
-                                 this->speaker_pending_.begin() + this->speaker_pending_offset_);
-    this->speaker_pending_offset_ = 0;
+  const size_t pcm_size = length - PROTOCOL_HEADER_SIZE;
+  if (this->speaker_buffer_->write_without_replacement(payload + PROTOCOL_HEADER_SIZE, pcm_size, 0, false) != pcm_size) {
+    this->stop_session_("speaker_overrun", true);
+    return;
   }
-  this->speaker_pending_.insert(this->speaker_pending_.end(), payload.begin() + PROTOCOL_HEADER_SIZE, payload.end());
-  this->process_speaker_();
+  this->speaker_sequence_initialized_ = true;
+  this->expected_speaker_sequence_ = sequence + 1;
+  this->expected_speaker_sample_index_ += pcm_size / 2;
+  this->speaker_high_water_bytes_ =
+      std::max<uint32_t>(this->speaker_high_water_bytes_, this->speaker_buffer_->available());
 }
 
 void NovaRealtime::process_speaker_() {
-  if (this->speaker_pending_.empty())
+  if (this->current_item_id_.empty() || this->flush_requested_)
     return;
-  size_t written = this->speaker_->play(this->speaker_pending_.data() + this->speaker_pending_offset_,
-                                        this->speaker_pending_.size() - this->speaker_pending_offset_,
-                                        pdMS_TO_TICKS(20));
-  this->speaker_pending_offset_ += written;
-  if (this->speaker_pending_offset_ >= this->speaker_pending_.size()) {
-    this->speaker_pending_.clear();
-    this->speaker_pending_offset_ = 0;
+  if (this->speaker_frame_offset_ >= this->speaker_frame_length_) {
+    this->speaker_frame_length_ =
+        this->speaker_buffer_->read(this->speaker_frame_.data(), SPEAKER_FRAME_BYTES, 0);
+    this->speaker_frame_offset_ = 0;
+  }
+  if (this->speaker_frame_length_ == 0)
+    return;
+  const size_t written = this->speaker_->play(this->speaker_frame_.data() + this->speaker_frame_offset_,
+                                              this->speaker_frame_length_ - this->speaker_frame_offset_, 0);
+  this->speaker_frame_offset_ += written;
+  if (this->speaker_frame_offset_ >= this->speaker_frame_length_)
+    this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
+}
+
+void NovaRealtime::process_flush_() {
+  if (!this->flush_requested_ || this->flush_item_id_.empty())
+    return;
+  const uint32_t now = millis();
+  const uint32_t played = this->played_samples_.load(std::memory_order_relaxed);
+  if (played != this->flush_last_played_samples_) {
+    this->flush_last_played_samples_ = played;
+    this->flush_quiet_since_ = now;
+  }
+  if (!this->speaker_->is_stopped() || now - this->flush_quiet_since_ < FLUSH_QUIET_MS)
+    return;
+  JsonDocument response;
+  response["type"] = "audio.flushed";
+  response["session_id"] = this->current_session_id_;
+  response["item_id"] = this->flush_item_id_;
+  response["played_samples"] = played;
+  std::string encoded;
+  serializeJson(response, encoded);
+  if (!this->queue_control_(encoded))
+    return;
+  this->current_item_id_.clear();
+  this->flush_item_id_.clear();
+  this->flush_requested_ = false;
+}
+
+void NovaRealtime::process_finish_() {
+  if (!this->finish_requested_ || this->current_item_id_.empty() || this->flush_requested_)
+    return;
+  if (!this->finish_called_ && this->speaker_buffer_->available() == 0 && this->speaker_frame_length_ == 0) {
+    this->speaker_->finish();
+    this->finish_called_ = true;
+  }
+  if (this->finish_called_ && this->speaker_->is_stopped() && !this->drained_reported_) {
+    this->report_played_(true);
+    JsonDocument report;
+    report["type"] = "audio.drained";
+    report["session_id"] = this->current_session_id_;
+    report["item_id"] = this->current_item_id_;
+    report["played_samples"] = this->played_samples_.load(std::memory_order_relaxed);
+    std::string encoded;
+    serializeJson(report, encoded);
+    if (this->queue_control_(encoded)) {
+      this->drained_reported_ = true;
+      this->current_item_id_.clear();
+    }
   }
 }
 
 void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
-  if (!this->session_active_)
+  if (!this->session_active_ || data.empty() || this->microphone_buffer_ == nullptr)
     return;
-  LockGuard lock(this->microphone_mutex_);
-  size_t overflow = this->microphone_buffer_.size() + data.size() > MAX_MICROPHONE_BUFFER
-                        ? this->microphone_buffer_.size() + data.size() - MAX_MICROPHONE_BUFFER
-                        : 0;
-  if (overflow >= this->microphone_buffer_.size()) {
-    this->microphone_buffer_.clear();
-  } else if (overflow > 0) {
-    this->microphone_buffer_.erase(this->microphone_buffer_.begin(), this->microphone_buffer_.begin() + overflow);
+  const uint8_t *source = data.data();
+  size_t length = data.size();
+  if (length > MICROPHONE_BUFFER_BYTES) {
+    source += length - MICROPHONE_BUFFER_BYTES;
+    length = MICROPHONE_BUFFER_BYTES;
+    this->microphone_discontinuity_ = true;
+    this->microphone_drops_pending_.fetch_add(1);
   }
-  this->microphone_buffer_.insert(this->microphone_buffer_.end(), data.begin(), data.end());
-  this->enable_loop_soon_any_context();
+  LockGuard lock(this->microphone_mutex_);
+  std::array<uint8_t, MICROPHONE_FRAME_BYTES> discarded{};
+  while (this->microphone_buffer_->free() < length && this->microphone_buffer_->available() != 0) {
+    size_t removed = this->microphone_buffer_->read(
+        discarded.data(), std::min(discarded.size(), this->microphone_buffer_->available()), 0);
+    if (removed == 0)
+      break;
+    this->microphone_discontinuity_ = true;
+    this->microphone_drops_pending_.fetch_add((removed + MICROPHONE_FRAME_BYTES - 1) / MICROPHONE_FRAME_BYTES);
+  }
+  this->microphone_buffer_->write_without_replacement(source, length, 0, false);
+  this->microphone_high_water_bytes_ =
+      std::max<uint32_t>(this->microphone_high_water_bytes_, this->microphone_buffer_->available());
+  if (this->tx_task_handle_.is_created())
+    xTaskNotifyGive(this->tx_task_handle_.get_handle());
 }
 
-void NovaRealtime::process_microphone_() {
-  if (!this->gateway_ready_ || !this->session_active_ || !this->socket_connected_)
-    return;
-  uint8_t frame[MICROPHONE_FRAME_BYTES];
+void NovaRealtime::tx_task_(void *parameter) { static_cast<NovaRealtime *>(parameter)->run_tx_task_(); }
+
+void NovaRealtime::run_tx_task_() {
+  OutgoingControl control;
+  while (!this->tx_stop_) {
+    if (this->control_queue_ != nullptr && xQueueReceive(this->control_queue_, &control, 0) == pdTRUE) {
+      if (this->socket_connected_ && this->client_ != nullptr) {
+        int result = esp_websocket_client_send_text(this->client_, control.data.data(), control.length,
+                                                    pdMS_TO_TICKS(50));
+        if (result < 0) {
+          ESP_LOGW(TAG, "Could not send gateway control frame");
+          this->socket_connected_ = false;
+          this->tx_transport_fault_ = true;
+          this->enable_loop_soon_any_context();
+        }
+      }
+      continue;
+    }
+    bool microphone_ready = false;
+    if (this->microphone_buffer_ != nullptr) {
+      LockGuard lock(this->microphone_mutex_);
+      microphone_ready = this->microphone_buffer_->available() >= MICROPHONE_FRAME_BYTES;
+    }
+    if (this->gateway_ready_ && this->session_active_ && this->socket_connected_ && microphone_ready) {
+      this->send_audio_from_task_();
+      continue;
+    }
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+  }
+  // Keep the task handle valid until StaticTask::deallocate() owns teardown.
+  vTaskSuspend(nullptr);
+}
+
+void NovaRealtime::send_audio_from_task_() {
+  std::array<uint8_t, PROTOCOL_HEADER_SIZE + MICROPHONE_FRAME_BYTES> frame{};
   {
     LockGuard lock(this->microphone_mutex_);
-    if (this->microphone_buffer_.size() < MICROPHONE_FRAME_BYTES)
+    if (this->microphone_buffer_->read(frame.data() + PROTOCOL_HEADER_SIZE, MICROPHONE_FRAME_BYTES, 0) !=
+        MICROPHONE_FRAME_BYTES)
       return;
-    std::memcpy(frame, this->microphone_buffer_.data(), MICROPHONE_FRAME_BYTES);
-    this->microphone_buffer_.erase(this->microphone_buffer_.begin(),
-                                   this->microphone_buffer_.begin() + MICROPHONE_FRAME_BYTES);
   }
-  this->send_audio_(frame, sizeof(frame));
+  std::memcpy(frame.data(), "NVR2", 4);
+  frame[4] = 2;
+  frame[5] = 1;
+  const bool discontinuity = this->microphone_discontinuity_.exchange(false);
+  frame[6] = 0;
+  frame[7] = discontinuity ? 1 : 0;
+  write_be32(frame.data() + 8, this->microphone_sequence_++);
+  write_be32(frame.data() + 12, this->microphone_sample_index_);
+  this->microphone_sample_index_ += MICROPHONE_FRAME_BYTES / 2;
+  int result = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char *>(frame.data()), frame.size(),
+                                             pdMS_TO_TICKS(50));
+  if (result < 0) {
+    this->microphone_discontinuity_ = true;
+    ESP_LOGW(TAG, "Could not send microphone frame");
+    this->socket_connected_ = false;
+    this->tx_transport_fault_ = true;
+    this->enable_loop_soon_any_context();
+  }
+}
+
+bool NovaRealtime::queue_control_(const std::string &payload) {
+  if (this->control_queue_ == nullptr || payload.empty() || payload.size() > MAX_OUTGOING_CONTROL_BYTES ||
+      !this->socket_connected_)
+    return false;
+  OutgoingControl control;
+  control.length = payload.size();
+  std::memcpy(control.data.data(), payload.data(), payload.size());
+  if (xQueueSend(this->control_queue_, &control, 0) != pdTRUE) {
+    this->control_overrun_ = true;
+    this->enable_loop_soon_any_context();
+    return false;
+  }
+  if (this->tx_task_handle_.is_created())
+    xTaskNotifyGive(this->tx_task_handle_.get_handle());
+  return true;
+}
+
+void NovaRealtime::report_played_(bool force) {
+  if (this->current_item_id_.empty() || !this->gateway_ready_)
+    return;
+  const uint32_t played = this->played_samples_.load(std::memory_order_relaxed);
+  if (!force && played - this->last_reported_samples_ < PLAYED_REPORT_INTERVAL)
+    return;
+  JsonDocument report;
+  report["type"] = "audio.played";
+  report["session_id"] = this->current_session_id_;
+  report["item_id"] = this->current_item_id_;
+  report["played_samples"] = played;
+  std::string encoded;
+  serializeJson(report, encoded);
+  if (this->queue_control_(encoded))
+    this->last_reported_samples_ = played;
 }
 
 void NovaRealtime::start_session(const std::string &wake_word) {
@@ -309,78 +660,134 @@ void NovaRealtime::start_session(const std::string &wake_word) {
     this->send_error_("gateway_unavailable", "Realtime gateway is not connected");
     return;
   }
-  if (this->session_active_)
+  if (this->session_state_ != SessionState::IDLE)
     return;
+  this->current_session_id_ = this->new_session_id_();
+  this->session_state_ = SessionState::STARTING;
   this->session_active_ = true;
+  this->session_start_deadline_ = millis() + SESSION_START_TIMEOUT_MS;
   {
     LockGuard lock(this->microphone_mutex_);
-    this->microphone_buffer_.clear();
+    this->microphone_buffer_->reset();
   }
-  this->microphone_->start();
-  this->set_state_("connecting");
+  this->microphone_drops_pending_ = 0;
+  this->microphone_discontinuity_ = false;
+  this->microphone_drop_window_started_ = millis();
+  this->microphone_drop_window_count_ = 0;
+  this->acquire_wifi_performance_();
   JsonDocument request;
   request["type"] = "session.start";
+  request["session_id"] = this->current_session_id_;
   request["wake_word"] = wake_word;
   std::string encoded;
   serializeJson(request, encoded);
-  this->send_control_(encoded);
+  if (!this->queue_control_(encoded)) {
+    this->reset_session_("armed");
+    return;
+  }
+  this->microphone_->start();
+  this->set_state_("connecting");
 }
 
-void NovaRealtime::stop_session(const std::string &reason) {
-  if (!this->session_active_)
+void NovaRealtime::stop_session(const std::string &reason) { this->stop_session_(reason, false); }
+
+void NovaRealtime::stop_session_(const std::string &reason, bool error) {
+  if (this->session_state_ == SessionState::IDLE)
     return;
+  this->session_state_ = SessionState::STOPPING;
   JsonDocument request;
   request["type"] = "session.stop";
+  request["session_id"] = this->current_session_id_;
   request["reason"] = reason;
+  request["result"] = error ? "error" : "cancelled";
   std::string encoded;
   serializeJson(request, encoded);
-  this->send_control_(encoded);
+  this->queue_control_(encoded);
+  this->reset_session_(this->gateway_ready_ ? "armed" : "offline");
+}
+
+void NovaRealtime::reset_session_(const std::string &phase) {
   this->session_active_ = false;
-  this->microphone_->stop();
-  this->speaker_->stop();
+  this->session_state_ = SessionState::IDLE;
+  if (this->microphone_ != nullptr)
+    this->microphone_->stop();
+  if (this->speaker_ != nullptr)
+    this->speaker_->stop();
+  if (this->microphone_buffer_ != nullptr) {
+    LockGuard lock(this->microphone_mutex_);
+    this->microphone_buffer_->reset();
+  }
+  if (this->speaker_buffer_ != nullptr)
+    this->speaker_buffer_->reset();
+  this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
+  this->finish_requested_ = this->finish_called_ = this->drained_reported_ = false;
+  this->flush_requested_ = false;
+  this->flush_item_id_.clear();
   this->current_item_id_.clear();
-  this->set_state_(this->gateway_ready_ ? "armed" : "offline");
+  this->current_session_id_.clear();
+  this->release_wifi_performance_();
+  this->set_state_(phase);
 }
 
-void NovaRealtime::report_played_(bool force) {
-  if (this->current_item_id_.empty() || !this->gateway_ready_)
+void NovaRealtime::acquire_wifi_performance_() {
+  if (this->wifi_performance_owned_ || wifi::global_wifi_component == nullptr)
     return;
-  uint32_t played = this->played_samples_.load(std::memory_order_relaxed);
-  if (!force && played - this->last_reported_samples_ < PLAYED_REPORT_INTERVAL)
+  if (wifi::global_wifi_component->request_high_performance()) {
+    wifi::global_wifi_component->request_roaming_suppression();
+    this->wifi_performance_owned_ = true;
+  }
+}
+
+void NovaRealtime::release_wifi_performance_() {
+  if (!this->wifi_performance_owned_ || wifi::global_wifi_component == nullptr)
     return;
-  JsonDocument report;
-  report["type"] = "audio.played";
-  report["item_id"] = this->current_item_id_;
-  report["played_samples"] = played;
+  wifi::global_wifi_component->release_roaming_suppression();
+  wifi::global_wifi_component->release_high_performance();
+  this->wifi_performance_owned_ = false;
+}
+
+std::string NovaRealtime::new_session_id_() {
+  uint32_t a = esp_random();
+  uint32_t b = esp_random();
+  uint32_t c = esp_random();
+  uint32_t d = esp_random();
+  b = (b & 0xFFFF0FFFU) | 0x00004000U;
+  c = (c & 0x3FFFFFFFU) | 0x80000000U;
+  char value[37];
+  std::snprintf(value, sizeof(value), "%08" PRIx32 "-%04" PRIx16 "-%04" PRIx16 "-%04" PRIx16 "-%04" PRIx16 "%08" PRIx32,
+                a, uint16_t(b >> 16), uint16_t(b), uint16_t(c >> 16), uint16_t(c), d);
+  return value;
+}
+
+void NovaRealtime::send_pong_(uint64_t timestamp_ms) {
+  uint32_t rx_high_water_bytes;
+  {
+    LockGuard lock(this->incoming_mutex_);
+    rx_high_water_bytes = this->rx_high_water_bytes_;
+  }
+  uint32_t microphone_high_water_bytes;
+  {
+    LockGuard lock(this->microphone_mutex_);
+    microphone_high_water_bytes = this->microphone_high_water_bytes_;
+  }
+  JsonDocument pong;
+  pong["type"] = "pong";
+  pong["timestamp_ms"] = timestamp_ms;
+  JsonObject diagnostics = pong["diagnostics"].to<JsonObject>();
+  diagnostics["free_heap_bytes"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  diagnostics["largest_free_block_bytes"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  diagnostics["free_psram_bytes"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  diagnostics["rx_high_water_bytes"] = rx_high_water_bytes;
+  diagnostics["speaker_high_water_bytes"] = this->speaker_high_water_bytes_;
+  diagnostics["mic_high_water_bytes"] = microphone_high_water_bytes;
+  diagnostics["loop_max_us"] = this->max_loop_us_;
+  diagnostics["microphone_drops"] = this->microphone_drops_total_;
+  diagnostics["transport_faults"] = this->transport_faults_total_;
+  diagnostics["reconnects"] = this->reconnect_count_.load(std::memory_order_relaxed);
+  diagnostics["uptime_ms"] = millis();
   std::string encoded;
-  serializeJson(report, encoded);
-  this->send_control_(encoded);
-  this->last_reported_samples_ = played;
-}
-
-void NovaRealtime::send_control_(const std::string &payload) {
-  if (this->client_ == nullptr || !this->socket_connected_)
-    return;
-  int result = esp_websocket_client_send_text(this->client_, payload.c_str(), payload.size(), pdMS_TO_TICKS(100));
-  if (result < 0)
-    ESP_LOGW(TAG, "Could not send gateway control frame");
-}
-
-void NovaRealtime::send_audio_(const uint8_t *pcm, size_t length) {
-  std::vector<uint8_t> frame(PROTOCOL_HEADER_SIZE + length);
-  std::memcpy(frame.data(), "NVR1", 4);
-  frame[4] = 1;
-  frame[5] = 1;
-  frame[6] = 0;
-  frame[7] = 0;
-  write_be32(frame.data() + 8, this->microphone_sequence_++);
-  write_be32(frame.data() + 12, this->microphone_sample_index_);
-  this->microphone_sample_index_ += length / 2;
-  std::memcpy(frame.data() + PROTOCOL_HEADER_SIZE, pcm, length);
-  int result = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char *>(frame.data()), frame.size(),
-                                             pdMS_TO_TICKS(100));
-  if (result < 0)
-    ESP_LOGW(TAG, "Could not send microphone frame");
+  serializeJson(pong, encoded);
+  this->queue_control_(encoded);
 }
 
 void NovaRealtime::send_error_(const std::string &code, const std::string &message) {
@@ -389,6 +796,9 @@ void NovaRealtime::send_error_(const std::string &code, const std::string &messa
 }
 
 void NovaRealtime::set_state_(const std::string &phase) {
+  if (phase == this->last_phase_)
+    return;
+  this->last_phase_ = phase;
   ESP_LOGD(TAG, "State: %s", phase.c_str());
   this->state_trigger_.trigger(phase);
 }

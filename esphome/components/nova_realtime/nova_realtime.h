@@ -1,18 +1,23 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
-#include <deque>
+#include <memory>
 #include <string>
-#include <vector>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 #include "esp_websocket_client.h"
 
 #include "esphome/components/microphone/microphone_source.h"
+#include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/static_task.h"
 
 namespace esphome::nova_realtime {
 
@@ -21,6 +26,7 @@ class NovaRealtime : public Component {
   void setup() override;
   void loop() override;
   void dump_config() override;
+  void on_shutdown() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
   void set_microphone_source(microphone::MicrophoneSource *microphone) { this->microphone_ = microphone; }
@@ -39,25 +45,54 @@ class NovaRealtime : public Component {
   Trigger<std::string, std::string> *get_error_trigger() { return &this->error_trigger_; }
 
  protected:
+  static constexpr size_t MAX_MESSAGE_BYTES = 2048;
+  static constexpr size_t INCOMING_SLOTS = 32;
+  static constexpr size_t OUTGOING_CONTROL_SLOTS = 8;
+  static constexpr size_t MAX_OUTGOING_CONTROL_BYTES = 768;
+  static constexpr size_t MICROPHONE_FRAME_BYTES = 640;
+  static constexpr size_t SPEAKER_FRAME_BYTES = 960;
+
+  enum class SessionState : uint8_t { IDLE, STARTING, ACTIVE, STOPPING };
+
   struct IncomingMessage {
-    bool binary;
-    std::vector<uint8_t> data;
+    bool binary{false};
+    uint16_t length{0};
+  };
+
+  struct OutgoingControl {
+    uint16_t length{0};
+    std::array<char, MAX_OUTGOING_CONTROL_BYTES> data{};
   };
 
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+  static void tx_task_(void *parameter);
+
   void handle_websocket_event_(int32_t event_id, esp_websocket_event_data_t *event);
+  bool enqueue_message_(bool binary, const uint8_t *data, size_t length);
+  void process_socket_event_();
+  bool queue_hello_();
   void connect_();
   void disconnect_();
-  void handle_control_(const std::string &payload);
-  void handle_audio_(const std::vector<uint8_t> &payload);
+  void destroy_client_();
+  void handle_control_(const uint8_t *payload, size_t length);
+  void handle_audio_(const uint8_t *payload, size_t length);
   void handle_microphone_data_(const std::vector<uint8_t> &data);
-  void process_microphone_();
   void process_speaker_();
+  void process_flush_();
+  void process_finish_();
   void report_played_(bool force = false);
-  void send_control_(const std::string &payload);
-  void send_audio_(const uint8_t *pcm, size_t length);
+  bool queue_control_(const std::string &payload);
+  void send_audio_from_task_();
+  void run_tx_task_();
   void send_error_(const std::string &code, const std::string &message);
   void set_state_(const std::string &phase);
+  void stop_session_(const std::string &reason, bool error);
+  void reset_session_(const std::string &phase);
+  void acquire_wifi_performance_();
+  void release_wifi_performance_();
+  std::string new_session_id_();
+  bool session_matches_(const char *session_id) const;
+  void send_pong_(uint64_t timestamp_ms);
 
   microphone::MicrophoneSource *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
@@ -67,25 +102,69 @@ class NovaRealtime : public Component {
   std::string device_id_;
 
   Mutex incoming_mutex_;
-  std::deque<IncomingMessage> incoming_;
-  std::vector<uint8_t> fragmented_message_;
-  bool fragmented_binary_{false};
+  std::array<IncomingMessage, INCOMING_SLOTS> incoming_messages_{};
+  uint8_t *incoming_storage_{nullptr};
+  uint8_t *fragment_storage_{nullptr};
+  size_t incoming_head_{0};
+  size_t incoming_tail_{0};
+  size_t incoming_count_{0};
+  size_t fragment_length_{0};
+  size_t fragment_expected_{0};
+  bool fragment_binary_{false};
 
+  std::unique_ptr<ring_buffer::RingBuffer> microphone_buffer_;
   Mutex microphone_mutex_;
-  std::vector<uint8_t> microphone_buffer_;
-  std::vector<uint8_t> speaker_pending_;
-  size_t speaker_pending_offset_{0};
+  std::unique_ptr<ring_buffer::RingBuffer> speaker_buffer_;
+  std::array<uint8_t, SPEAKER_FRAME_BYTES> speaker_frame_{};
+  size_t speaker_frame_length_{0};
+  size_t speaker_frame_offset_{0};
+
+  QueueHandle_t control_queue_{nullptr};
+  StaticTask tx_task_handle_;
+  std::atomic<bool> tx_stop_{false};
 
   std::atomic<bool> socket_connected_{false};
   std::atomic<bool> gateway_ready_{false};
   std::atomic<bool> session_active_{false};
   std::atomic<bool> incoming_overrun_{false};
+  std::atomic<bool> control_overrun_{false};
+  std::atomic<bool> tx_transport_fault_{false};
+  std::atomic<int8_t> socket_event_{0};
+  std::atomic<bool> microphone_discontinuity_{false};
+  std::atomic<uint32_t> microphone_drops_pending_{0};
+  std::atomic<uint32_t> played_samples_{0};
+
+  SessionState session_state_{SessionState::IDLE};
   uint32_t next_connect_at_{0};
+  uint32_t session_start_deadline_{0};
   uint32_t microphone_sequence_{0};
   uint32_t microphone_sample_index_{0};
-  std::string current_item_id_;
-  std::atomic<uint32_t> played_samples_{0};
+  uint32_t expected_speaker_sequence_{0};
+  uint32_t expected_speaker_sample_index_{0};
+  uint32_t total_speaker_samples_{0};
   uint32_t last_reported_samples_{0};
+  uint32_t microphone_drop_window_started_{0};
+  uint32_t microphone_drop_window_count_{0};
+  uint32_t microphone_drops_total_{0};
+  uint32_t transport_faults_total_{0};
+  std::atomic<uint32_t> reconnect_count_{0};
+  uint32_t rx_high_water_bytes_{0};
+  uint32_t speaker_high_water_bytes_{0};
+  uint32_t microphone_high_water_bytes_{0};
+  uint32_t max_loop_us_{0};
+  bool speaker_sequence_initialized_{false};
+  bool finish_requested_{false};
+  bool finish_called_{false};
+  bool drained_reported_{false};
+  bool flush_requested_{false};
+  uint32_t flush_last_played_samples_{0};
+  uint32_t flush_quiet_since_{0};
+  bool wifi_performance_owned_{false};
+  bool hello_pending_{false};
+  std::string flush_item_id_;
+  std::string current_session_id_;
+  std::string current_item_id_;
+  std::string last_phase_;
 
   Trigger<> connected_trigger_;
   Trigger<> disconnected_trigger_;

@@ -2,13 +2,13 @@ import re
 
 from esphome import automation
 import esphome.codegen as cg
-from esphome.components import esp32, microphone, speaker
+from esphome.components import esp32, microphone, speaker, wifi
 import esphome.config_validation as cv
 from esphome.const import CONF_ID, CONF_MICROPHONE, CONF_SPEAKER
 
 
-DEPENDENCIES = ["esp32", "microphone", "network", "speaker"]
-AUTO_LOAD = ["audio", "json"]
+DEPENDENCIES = ["esp32", "microphone", "network", "speaker", "wifi"]
+AUTO_LOAD = ["audio", "json", "ring_buffer"]
 CODEOWNERS = []
 
 CONF_GATEWAY_URL = "gateway_url"
@@ -78,13 +78,18 @@ FINAL_VALIDATE_SCHEMA = cv.Schema(
 
 
 async def to_code(config):
+    # Opt into ESPHome's reference-counted runtime controls. Without these
+    # requests the public C++ APIs are intentionally compiled out.
+    wifi.enable_runtime_power_save_control()
+    wifi.enable_runtime_roaming_suppression()
+
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    # microWakeWord owns the physical capture lifecycle. NOVA passively consumes
-    # the same stream and gates transmission with its own session state.
+    # NOVA participates in the physical capture lifecycle so conversion work is
+    # gated by its session and listener counting keeps shared capture active.
     mic_source = await microphone.microphone_source_to_code(
-        config[CONF_MICROPHONE], passive=True
+        config[CONF_MICROPHONE], passive=False
     )
     cg.add(var.set_microphone_source(mic_source))
     output = await cg.get_variable(config[CONF_SPEAKER])
@@ -111,7 +116,7 @@ async def to_code(config):
 
     esp32.add_idf_component(
         name="espressif/esp_websocket_client",
-        ref="1.5.0",
+        ref="1.7.0",
     )
 
 

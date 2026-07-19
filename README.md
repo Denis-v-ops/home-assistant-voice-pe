@@ -24,11 +24,20 @@ packages:
   nova_voice_pe:
     url: https://github.com/Denis-v-ops/home-assistant-voice-PE
     file: home-assistant-voice.yaml
-    ref: dev
-    refresh: 5min
+    ref: nova-v0.3.0
+
+external_components:
+  - source: github://Denis-v-ops/home-assistant-voice-PE@nova-v0.3.0
+    components:
+      - voice_kit
+      - nova_realtime
 ```
 
-The gateway URL is a direct `ws://` LAN endpoint; this design assumes the
+`nova-v0.3.0` is the immutable coordinated-release tag. Publish it from the
+reviewed firmware commit before using this production wrapper; pre-release CI
+uses the checked-out local component and sound files instead.
+
+The gateway URL ends in `/v2/device` and is a direct `ws://` LAN endpoint; this design assumes the
 gateway port is not forwarded or otherwise exposed outside the trusted home
 network.
 
