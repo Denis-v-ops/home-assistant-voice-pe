@@ -15,7 +15,6 @@
 namespace esphome::nova_realtime {
 
 static const char *const TAG = "nova_realtime";
-static constexpr size_t PROTOCOL_HEADER_SIZE = 16;
 static constexpr size_t MICROPHONE_BUFFER_BYTES = 16000;
 static constexpr size_t SPEAKER_BUFFER_BYTES = 19200;
 static constexpr uint32_t PLAYED_REPORT_INTERVAL = 960;
@@ -26,7 +25,10 @@ static constexpr uint32_t FLUSH_QUIET_MS = 10;
 static constexpr uint32_t LOOP_BUDGET_US = 2000;
 static constexpr size_t LOOP_MESSAGE_BUDGET = 4;
 static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
-static constexpr uint32_t TX_TASK_STACK_WORDS = 1024;
+// StaticTask sizes are StackType_t words; 2048 words is 8 KiB on ESP32.
+static constexpr uint32_t TX_TASK_STACK_WORDS = 2048;
+// esp_websocket_client task_stack is expressed in bytes.
+static constexpr int WEBSOCKET_TASK_STACK_BYTES = 8192;
 
 static bool deadline_reached(uint32_t now, uint32_t deadline) { return static_cast<int32_t>(now - deadline) >= 0; }
 
@@ -72,7 +74,8 @@ void NovaRealtime::setup() {
     return;
   }
   this->next_connect_at_ = millis() + this->connect_delay_ms_;
-  ESP_LOGI(TAG, "NOVA transport initialized");
+  ESP_LOGI(TAG, "NOVA transport initialized (TX stack: %u bytes, WebSocket stack: %d bytes)",
+           unsigned(TX_TASK_STACK_WORDS * sizeof(StackType_t)), WEBSOCKET_TASK_STACK_BYTES);
 }
 
 void NovaRealtime::dump_config() {
@@ -208,6 +211,7 @@ void NovaRealtime::connect_() {
   config.keep_alive_interval = 5;
   config.keep_alive_count = 3;
   config.buffer_size = MAX_MESSAGE_BYTES;
+  config.task_stack = WEBSOCKET_TASK_STACK_BYTES;
   config.task_core_id_set = false;
   this->client_ = esp_websocket_client_init(&config);
   if (this->client_ == nullptr) {
@@ -578,12 +582,12 @@ void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
 void NovaRealtime::tx_task_(void *parameter) { static_cast<NovaRealtime *>(parameter)->run_tx_task_(); }
 
 void NovaRealtime::run_tx_task_() {
-  OutgoingControl control;
   while (!this->tx_stop_) {
-    if (this->control_queue_ != nullptr && xQueueReceive(this->control_queue_, &control, 0) == pdTRUE) {
+    if (this->control_queue_ != nullptr && xQueueReceive(this->control_queue_, &this->tx_control_, 0) == pdTRUE) {
       if (this->socket_connected_ && this->client_ != nullptr) {
-        int result = esp_websocket_client_send_text(this->client_, control.data.data(), control.length,
-                                                    pdMS_TO_TICKS(50));
+        int result =
+            esp_websocket_client_send_text(this->client_, this->tx_control_.data.data(), this->tx_control_.length,
+                                           pdMS_TO_TICKS(50));
         if (result < 0) {
           ESP_LOGW(TAG, "Could not send gateway control frame");
           this->socket_connected_ = false;
@@ -609,7 +613,7 @@ void NovaRealtime::run_tx_task_() {
 }
 
 void NovaRealtime::send_audio_from_task_() {
-  std::array<uint8_t, PROTOCOL_HEADER_SIZE + MICROPHONE_FRAME_BYTES> frame{};
+  auto &frame = this->tx_audio_frame_;
   {
     LockGuard lock(this->microphone_mutex_);
     if (this->microphone_buffer_->read(frame.data() + PROTOCOL_HEADER_SIZE, MICROPHONE_FRAME_BYTES, 0) !=
@@ -801,6 +805,10 @@ void NovaRealtime::send_pong_(uint64_t timestamp_ms) {
   diagnostics["microphone_drops"] = this->microphone_drops_total_;
   diagnostics["transport_faults"] = this->transport_faults_total_;
   diagnostics["reconnects"] = this->reconnect_count_.load(std::memory_order_relaxed);
+  diagnostics["tx_stack_low_water_bytes"] =
+      this->tx_task_handle_.is_created()
+          ? uxTaskGetStackHighWaterMark(this->tx_task_handle_.get_handle()) * sizeof(StackType_t)
+          : 0;
   diagnostics["uptime_ms"] = millis();
   std::string encoded;
   serializeJson(pong, encoded);

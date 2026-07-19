@@ -51,6 +51,7 @@ class NovaRealtime : public Component {
   static constexpr size_t INCOMING_SLOTS = 32;
   static constexpr size_t OUTGOING_CONTROL_SLOTS = 8;
   static constexpr size_t MAX_OUTGOING_CONTROL_BYTES = 768;
+  static constexpr size_t PROTOCOL_HEADER_SIZE = 16;
   static constexpr size_t MICROPHONE_FRAME_BYTES = 640;
   static constexpr size_t SPEAKER_FRAME_BYTES = 960;
 
@@ -123,6 +124,11 @@ class NovaRealtime : public Component {
 
   QueueHandle_t control_queue_{nullptr};
   StaticTask tx_task_handle_;
+  // These buffers are deliberately owned by the component instead of living
+  // on nova_tx's stack. The websocket send path needs several kilobytes of
+  // call-stack headroom on ESP-IDF 5.5.
+  OutgoingControl tx_control_{};
+  std::array<uint8_t, PROTOCOL_HEADER_SIZE + MICROPHONE_FRAME_BYTES> tx_audio_frame_{};
   std::atomic<bool> tx_stop_{false};
 
   std::atomic<bool> socket_connected_{false};
