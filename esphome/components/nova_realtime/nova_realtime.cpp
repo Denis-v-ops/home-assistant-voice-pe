@@ -529,13 +529,14 @@ void NovaRealtime::process_flush_() {
   if (!this->flush_requested_ || this->flush_item_id_.empty())
     return;
   const uint32_t now = millis();
-  const uint32_t played = this->played_samples_.load(std::memory_order_relaxed);
-  if (played != this->flush_last_played_samples_) {
-    this->flush_last_played_samples_ = played;
+  const uint32_t raw_played = this->played_samples_.load(std::memory_order_relaxed);
+  if (raw_played != this->flush_last_played_samples_) {
+    this->flush_last_played_samples_ = raw_played;
     this->flush_quiet_since_ = now;
   }
   if (!this->speaker_->is_stopped() || now - this->flush_quiet_since_ < FLUSH_QUIET_MS)
     return;
+  const uint32_t played = std::min(raw_played, this->expected_speaker_sample_index_);
   JsonDocument response;
   response["type"] = "audio.flushed";
   response["session_id"] = this->current_session_id_;
@@ -558,12 +559,17 @@ void NovaRealtime::process_finish_() {
     this->finish_called_ = true;
   }
   if (this->finish_called_ && this->speaker_->is_stopped() && !this->drained_reported_) {
+    // The resampler callback counts source-equivalent DAC frames. Its filter
+    // shutdown may under-count the original 24 kHz input by a small amount,
+    // even though every buffer has drained. At this point graceful finish is
+    // authoritative, so report the canonical input position.
+    this->played_samples_.store(this->total_speaker_samples_, std::memory_order_relaxed);
     this->report_played_(true);
     JsonDocument report;
     report["type"] = "audio.drained";
     report["session_id"] = this->current_session_id_;
     report["item_id"] = this->current_item_id_;
-    report["played_samples"] = this->played_samples_.load(std::memory_order_relaxed);
+    report["played_samples"] = this->total_speaker_samples_;
     std::string encoded;
     serializeJson(report, encoded);
     if (this->queue_control_(encoded)) {
@@ -699,7 +705,8 @@ bool NovaRealtime::queue_control_(const std::string &payload) {
 void NovaRealtime::report_played_(bool force) {
   if (this->current_item_id_.empty() || !this->gateway_ready_)
     return;
-  const uint32_t played = this->played_samples_.load(std::memory_order_relaxed);
+  const uint32_t played = std::min(this->played_samples_.load(std::memory_order_relaxed),
+                                   this->expected_speaker_sample_index_);
   if (!force && played - this->last_reported_samples_ < PLAYED_REPORT_INTERVAL)
     return;
   JsonDocument report;
