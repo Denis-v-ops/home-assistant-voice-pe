@@ -19,6 +19,7 @@ static constexpr size_t MICROPHONE_BUFFER_BYTES = 16000;
 static constexpr size_t SPEAKER_BUFFER_BYTES = 19200;
 static constexpr uint32_t PLAYED_REPORT_INTERVAL = 960;
 static constexpr uint32_t SESSION_START_TIMEOUT_MS = 20000;
+static constexpr uint32_t PENDING_WAKE_TIMEOUT_MS = 1500;
 static constexpr uint32_t MICROPHONE_DROP_WINDOW_MS = 5000;
 static constexpr uint32_t MICROPHONE_DROP_LIMIT = 25;
 static constexpr uint32_t FLUSH_QUIET_MS = 10;
@@ -48,8 +49,10 @@ static void write_be32(uint8_t *data, uint32_t value) {
 void NovaRealtime::setup() {
   if (!this->enabled_) {
     ESP_LOGW(TAG, "NOVA transport disabled by configuration; API and OTA remain available");
+    this->publish_wake_status_("Unavailable");
     return;
   }
+  this->publish_wake_status_("Starting");
   ESP_LOGI(TAG, "Initializing bounded NOVA transport");
   RAMAllocator<uint8_t> external_allocator(RAMAllocator<uint8_t>::ALLOC_EXTERNAL);
   this->incoming_storage_ = external_allocator.allocate(INCOMING_SLOTS * MAX_MESSAGE_BYTES);
@@ -90,6 +93,7 @@ void NovaRealtime::dump_config() {
                 "  Playback window: 300 ms\n"
                 "  Speaker buffer: 400 ms\n"
                 "  Microphone buffer: 500 ms\n"
+                "  Remote wake: gateway-only Hey Nova (English/German)\n"
                 "  Transport: trusted LAN WebSocket",
                 YESNO(this->enabled_), this->connect_delay_ms_, this->gateway_url_.c_str(), this->device_id_.c_str());
 }
@@ -97,6 +101,8 @@ void NovaRealtime::dump_config() {
 void NovaRealtime::on_shutdown() {
   if (!this->enabled_)
     return;
+  this->gateway_ready_ = false;
+  this->remote_wake_enabled_ = false;
   this->reset_session_("offline");
   this->tx_stop_ = true;
   if (this->tx_task_handle_.is_created()) {
@@ -205,6 +211,8 @@ void NovaRealtime::loop() {
     this->send_error_("session_start_timeout", "Gateway did not start the session in time");
     this->stop_session_("session_start_timeout", true);
   }
+  if (!this->pending_wake_session_id_.empty() && deadline_reached(now, this->pending_wake_deadline_))
+    this->reject_wake("automation_timeout");
 
   const uint32_t elapsed = micros() - loop_started;
   this->max_loop_us_ = std::max(this->max_loop_us_, elapsed);
@@ -253,6 +261,8 @@ void NovaRealtime::destroy_client_() {
 void NovaRealtime::disconnect_() {
   const bool notify = this->gateway_ready_.exchange(false);
   this->socket_connected_ = false;
+  this->remote_wake_enabled_ = false;
+  this->wake_generation_ = 0;
   if (this->control_queue_ != nullptr)
     xQueueReset(this->control_queue_);
   {
@@ -364,6 +374,7 @@ bool NovaRealtime::queue_hello_() {
   char boot_id[9];
   std::snprintf(boot_id, sizeof(boot_id), "%08" PRIx32, esp_random());
   hello["boot_id"] = boot_id;
+  hello["capabilities"]["remote_wake"] = 1;
   hello["output_flow"]["mode"] = "played_window";
   hello["output_flow"]["max_inflight_samples"] = 7200;
   hello["output_flow"]["played_report_interval_samples"] = PLAYED_REPORT_INTERVAL;
@@ -396,12 +407,54 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
     this->expected_speaker_sequence_ = 0;
     this->speaker_sequence_initialized_ = false;
     this->connected_trigger_.trigger();
-    this->set_state_("armed");
+    JsonObjectConst wake_config = document["remote_wake"].as<JsonObjectConst>();
+    if (wake_config.isNull()) {
+      this->remote_wake_enabled_ = false;
+      this->wake_generation_ = 0;
+      this->stop_standby_("Unavailable");
+      this->set_state_("offline");
+    } else {
+      this->apply_wake_configuration_(wake_config);
+    }
+  } else if (std::strcmp(type, "wake.configure") == 0) {
+    this->apply_wake_configuration_(document.as<JsonObjectConst>());
+  } else if (std::strcmp(type, "wake.detected") == 0) {
+    const uint32_t generation = document["generation"] | uint32_t(0);
+    const std::string session_id = document["session_id"] | "";
+    const std::string wake_word = document["wake_word"] | "";
+    if (generation != this->wake_generation_)
+      return;
+    if (!this->remote_wake_enabled_ || this->muted_ || this->session_state_ != SessionState::IDLE ||
+        !this->pending_wake_session_id_.empty() || session_id.empty() || session_id.size() > 36 ||
+        wake_word != "hey_nova") {
+      JsonDocument response;
+      response["type"] = "wake.rejected";
+      response["generation"] = generation;
+      response["session_id"] = session_id;
+      response["reason"] = "device_busy";
+      std::string encoded;
+      serializeJson(response, encoded);
+      this->queue_control_(encoded);
+      return;
+    }
+    this->stop_standby_("Paused");
+    this->pending_wake_session_id_ = session_id;
+    this->pending_wake_word_ = wake_word;
+    this->pending_wake_deadline_ = millis() + PENDING_WAKE_TIMEOUT_MS;
+    this->remote_wake_trigger_.trigger(session_id, wake_word);
+  } else if (std::strcmp(type, "wake.cancel") == 0) {
+    const uint32_t generation = document["generation"] | uint32_t(0);
+    const std::string session_id = document["session_id"] | "";
+    if (generation == this->wake_generation_ && session_id == this->pending_wake_session_id_) {
+      this->clear_pending_wake_();
+      this->start_standby_();
+    }
   } else if (std::strcmp(type, "ping") == 0) {
     this->send_pong_(document["timestamp_ms"] | uint64_t(0));
   } else if (std::strcmp(type, "state") == 0) {
     const char *session_id = document["session_id"] | "";
     if (this->current_session_id_.empty()) {
+      this->stop_standby_("Paused");
       this->current_session_id_ = session_id;
       this->session_state_ = SessionState::STARTING;
       this->session_active_ = true;
@@ -411,9 +464,10 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
     }
     if (this->session_matches_(session_id)) {
       const char *phase = document["phase"] | "unknown";
-      this->set_microphone_streaming_(std::strcmp(phase, "connecting") == 0 ||
-                                      std::strcmp(phase, "listening") == 0 ||
-                                      std::strcmp(phase, "user_speaking") == 0);
+      this->set_microphone_streaming_(!this->muted_ && (std::strcmp(phase, "connecting") == 0 ||
+                                                        std::strcmp(phase, "listening") == 0 ||
+                                                        std::strcmp(phase, "user_speaking") == 0));
+      this->publish_wake_status_(this->muted_ ? "Muted" : "Paused");
       this->set_state_(phase);
     }
   } else if (std::strcmp(type, "session.started") == 0) {
@@ -580,7 +634,7 @@ void NovaRealtime::process_finish_() {
 }
 
 void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
-  if (!this->session_active_ || !this->microphone_streaming_ || data.empty() || this->microphone_buffer_ == nullptr)
+  if (!this->microphone_streaming_ || data.empty() || this->microphone_buffer_ == nullptr)
     return;
   const uint32_t callback_count = this->microphone_callback_count_.fetch_add(1, std::memory_order_relaxed);
   if ((callback_count & 0x3FU) == 0) {
@@ -644,7 +698,7 @@ void NovaRealtime::run_tx_task_() {
       LockGuard lock(this->microphone_mutex_);
       microphone_ready = this->microphone_buffer_->available() >= MICROPHONE_FRAME_BYTES;
     }
-    if (this->gateway_ready_ && this->session_active_ && this->microphone_streaming_ && this->socket_connected_ &&
+    if (this->gateway_ready_ && this->microphone_streaming_ && this->socket_connected_ &&
         microphone_ready) {
       this->send_audio_from_task_();
       continue;
@@ -727,8 +781,9 @@ void NovaRealtime::start_session(const std::string &wake_word) {
     this->send_error_("gateway_unavailable", "Realtime gateway is not connected");
     return;
   }
-  if (this->session_state_ != SessionState::IDLE)
+  if (this->session_state_ != SessionState::IDLE || !this->pending_wake_session_id_.empty() || this->muted_)
     return;
+  this->stop_standby_("Paused");
   this->current_session_id_ = this->new_session_id_();
   this->session_state_ = SessionState::STARTING;
   this->session_active_ = true;
@@ -738,13 +793,14 @@ void NovaRealtime::start_session(const std::string &wake_word) {
     this->microphone_buffer_->reset();
   }
   this->microphone_drops_pending_ = 0;
-  this->microphone_discontinuity_ = false;
+  this->microphone_discontinuity_ = true;
   this->microphone_drop_window_started_ = millis();
   this->microphone_drop_window_count_ = 0;
   this->microphone_callback_count_ = 0;
   this->microphone_callback_stack_low_water_bytes_ = 0xFFFFFFFFUL;
   this->session_stack_reported_ = false;
   this->set_microphone_streaming_(true);
+  this->standby_active_ = false;
   this->acquire_wifi_performance_();
   JsonDocument request;
   request["type"] = "session.start";
@@ -757,10 +813,70 @@ void NovaRealtime::start_session(const std::string &wake_word) {
     return;
   }
   this->microphone_->start();
+  this->publish_wake_status_("Paused");
   this->set_state_("connecting");
 }
 
-void NovaRealtime::stop_session(const std::string &reason) { this->stop_session_(reason, false); }
+void NovaRealtime::accept_wake() {
+  if (this->pending_wake_session_id_.empty() || !this->gateway_ready_ || !this->remote_wake_enabled_ || this->muted_)
+    return;
+  const std::string session_id = this->pending_wake_session_id_;
+  this->current_session_id_ = session_id;
+  this->clear_pending_wake_();
+  this->session_state_ = SessionState::STARTING;
+  this->session_active_ = true;
+  this->session_start_deadline_ = millis() + SESSION_START_TIMEOUT_MS;
+  {
+    LockGuard lock(this->microphone_mutex_);
+    this->microphone_buffer_->reset();
+  }
+  this->microphone_drops_pending_ = 0;
+  this->microphone_discontinuity_ = true;
+  this->microphone_drop_window_started_ = millis();
+  this->microphone_drop_window_count_ = 0;
+  this->microphone_callback_count_ = 0;
+  this->microphone_callback_stack_low_water_bytes_ = 0xFFFFFFFFUL;
+  this->session_stack_reported_ = false;
+  JsonDocument response;
+  response["type"] = "wake.accepted";
+  response["generation"] = this->wake_generation_;
+  response["session_id"] = session_id;
+  std::string encoded;
+  serializeJson(response, encoded);
+  if (!this->queue_control_(encoded)) {
+    this->reset_session_("armed");
+    return;
+  }
+  this->standby_active_ = false;
+  this->set_microphone_streaming_(true);
+  this->acquire_wifi_performance_();
+  this->microphone_->start();
+  this->publish_wake_status_("Paused");
+  this->set_state_("connecting");
+}
+
+void NovaRealtime::reject_wake(const std::string &reason) {
+  if (this->pending_wake_session_id_.empty())
+    return;
+  JsonDocument response;
+  response["type"] = "wake.rejected";
+  response["generation"] = this->wake_generation_;
+  response["session_id"] = this->pending_wake_session_id_;
+  response["reason"] = reason;
+  std::string encoded;
+  serializeJson(response, encoded);
+  this->queue_control_(encoded);
+  this->clear_pending_wake_();
+  this->start_standby_();
+}
+
+void NovaRealtime::stop_session(const std::string &reason) {
+  if (!this->pending_wake_session_id_.empty()) {
+    this->reject_wake(reason);
+    return;
+  }
+  this->stop_session_(reason, false);
+}
 
 void NovaRealtime::stop_session_(const std::string &reason, bool error) {
   if (this->session_state_ == SessionState::IDLE)
@@ -780,6 +896,7 @@ void NovaRealtime::stop_session_(const std::string &reason, bool error) {
 void NovaRealtime::reset_session_(const std::string &phase) {
   this->session_active_ = false;
   this->session_state_ = SessionState::IDLE;
+  this->standby_active_ = false;
   this->set_microphone_streaming_(false);
   if (this->microphone_ != nullptr)
     this->microphone_->stop();
@@ -797,8 +914,150 @@ void NovaRealtime::reset_session_(const std::string &phase) {
   this->flush_item_id_.clear();
   this->current_item_id_.clear();
   this->current_session_id_.clear();
+  this->clear_pending_wake_();
   this->release_wifi_performance_();
-  this->set_state_(phase);
+  if (phase != "offline" && this->gateway_ready_ && this->remote_wake_enabled_ && !this->muted_)
+    this->start_standby_();
+  else {
+    this->publish_wake_status_(this->muted_ ? "Muted" : "Unavailable");
+    this->set_state_(phase);
+  }
+}
+
+void NovaRealtime::start_standby_() {
+  if (!this->gateway_ready_ || !this->remote_wake_enabled_) {
+    this->stop_standby_("Unavailable");
+    this->set_state_("offline");
+    return;
+  }
+  if (this->muted_) {
+    this->stop_standby_("Muted");
+    return;
+  }
+  if (this->session_state_ != SessionState::IDLE || !this->pending_wake_session_id_.empty())
+    return;
+  {
+    LockGuard lock(this->microphone_mutex_);
+    this->microphone_buffer_->reset();
+  }
+  this->microphone_discontinuity_ = true;
+  this->microphone_drops_pending_ = 0;
+  this->microphone_drop_window_started_ = millis();
+  this->microphone_drop_window_count_ = 0;
+  this->standby_active_ = true;
+  this->set_microphone_streaming_(true);
+  this->acquire_wifi_performance_();
+  this->send_wake_status_("armed");
+  this->microphone_->start();
+  this->publish_wake_status_("Listening");
+  this->set_state_("armed");
+}
+
+void NovaRealtime::stop_standby_(const std::string &status) {
+  this->standby_active_ = false;
+  this->set_microphone_streaming_(false);
+  if (!this->session_active_ && this->microphone_ != nullptr)
+    this->microphone_->stop();
+  if (this->gateway_ready_ && this->wake_generation_ != 0)
+    this->send_wake_status_(status == "Unavailable" ? "unavailable" : "suspended");
+  if (!this->session_active_ && status != "Paused")
+    this->release_wifi_performance_();
+  this->publish_wake_status_(status);
+}
+
+void NovaRealtime::apply_wake_configuration_(JsonObjectConst config) {
+  const uint32_t generation = config["generation"] | uint32_t(0);
+  if ((config["version"] | 0) != 1 || generation == 0)
+    return;
+  if (this->wake_generation_ != 0 && generation <= this->wake_generation_)
+    return;
+  const bool active_session = this->session_active_;
+  if (!active_session) {
+    this->set_microphone_streaming_(false);
+    if (this->microphone_ != nullptr)
+      this->microphone_->stop();
+    this->standby_active_ = false;
+  }
+  this->wake_generation_ = generation;
+  JsonArrayConst languages = config["languages"].as<JsonArrayConst>();
+  const bool bilingual = languages.size() == 2 && std::string(languages[0] | "") == "en" &&
+                         std::string(languages[1] | "") == "de";
+  this->remote_wake_enabled_ = bool(config["enabled"] | false) &&
+                               std::string(config["wake_word"] | "") == "hey_nova" && bilingual;
+  if (!this->remote_wake_enabled_) {
+    if (active_session) {
+      this->send_wake_status_("unavailable");
+      this->publish_wake_status_("Unavailable");
+    } else {
+      this->stop_standby_("Unavailable");
+      this->set_state_("offline");
+    }
+    return;
+  }
+  if (active_session) {
+    this->send_wake_status_("suspended");
+    this->publish_wake_status_(this->muted_ ? "Muted" : "Paused");
+    return;
+  }
+  this->start_standby_();
+}
+
+void NovaRealtime::send_wake_status_(const std::string &state) {
+  if (!this->socket_connected_ || this->wake_generation_ == 0)
+    return;
+  JsonDocument status;
+  status["type"] = "wake.status";
+  status["generation"] = this->wake_generation_;
+  status["state"] = state;
+  std::string encoded;
+  serializeJson(status, encoded);
+  this->queue_control_(encoded);
+}
+
+void NovaRealtime::publish_wake_status_(const std::string &status) {
+  if (status == this->last_wake_status_)
+    return;
+  this->last_wake_status_ = status;
+  if (this->wake_word_status_ != nullptr)
+    this->wake_word_status_->publish_state(status);
+}
+
+void NovaRealtime::clear_pending_wake_() {
+  this->pending_wake_session_id_.clear();
+  this->pending_wake_word_.clear();
+  this->pending_wake_deadline_ = 0;
+}
+
+void NovaRealtime::set_muted(bool muted) {
+  if (this->muted_ == muted)
+    return;
+  this->muted_ = muted;
+  if (muted) {
+    if (!this->pending_wake_session_id_.empty())
+      this->reject_wake("muted");
+    this->set_microphone_streaming_(false);
+    this->standby_active_ = false;
+    if (this->microphone_ != nullptr)
+      this->microphone_->stop();
+    if (!this->session_active_)
+      this->release_wifi_performance_();
+    this->send_wake_status_("suspended");
+    this->publish_wake_status_("Muted");
+    return;
+  }
+  if (this->session_active_) {
+    const bool should_stream = this->last_phase_ == "connecting" || this->last_phase_ == "listening" ||
+                               this->last_phase_ == "user_speaking";
+    if (should_stream) {
+      this->microphone_discontinuity_ = true;
+      this->microphone_->start();
+      this->set_microphone_streaming_(true);
+    }
+    this->send_wake_status_("suspended");
+    this->publish_wake_status_("Paused");
+  } else {
+    this->start_standby_();
+  }
 }
 
 void NovaRealtime::acquire_wifi_performance_() {

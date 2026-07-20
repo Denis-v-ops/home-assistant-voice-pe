@@ -3,9 +3,11 @@
 This is the ESPHome source code of the [Home Assistant Voice: Preview Edition](https://www.home-assistant.io/voice-pe/).
 
 This fork replaces the Home Assistant Assist audio pipeline with the NOVA
-Realtime device protocol. Wake-word/VAD processing remains local; an active
-session streams mono PCM over the trusted home LAN to the Portainer gateway in
-the sibling `gladosAgent` repository.
+Realtime device protocol. While unmuted, 16 kHz mono PCM streams continuously
+over the trusted home LAN to the Portainer gateway in the sibling
+`gladosAgent` repository, where the fixed bilingual **Hey Nova** model runs.
+Idle audio is not stored or sent to OpenAI; only audio after an accepted wake
+handoff enters a realtime session.
 
 This repository is designed to be loaded as a remote ESPHome package. Its
 external components are cloned from this repository and its embedded sounds are
@@ -60,9 +62,12 @@ Normal builds wait ten seconds before their first gateway connection so API
 logs can attach before transport startup. For a longer diagnostic window,
 override `nova_connect_delay_ms` with a value up to `60000`.
 
-The center button or a configured wake word starts NOVA; another wake-word/stop
-word or center-button press interrupts it. The device deliberately has no
-Assist or timer fallback.
+The center button or **Hey Nova** starts NOVA. The center button rejects a
+pending wake or interrupts an active session. There is no microWakeWord, local
+wake/stop model, phrase catalog, or sensitivity setting, and the device
+deliberately has no Assist or timer fallback. If the gateway is unavailable,
+voice wake is unavailable; the center button remains usable once the gateway
+connection returns.
 
 See [the documentation](https://voice-pe.home-assistant.io/) for set up and troubleshooting.
 

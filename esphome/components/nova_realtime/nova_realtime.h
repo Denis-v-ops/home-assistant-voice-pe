@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
@@ -14,6 +15,7 @@
 #include "esphome/components/microphone/microphone_source.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/components/speaker/speaker.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
@@ -31,6 +33,7 @@ class NovaRealtime : public Component {
 
   void set_microphone_source(microphone::MicrophoneSource *microphone) { this->microphone_ = microphone; }
   void set_speaker(speaker::Speaker *speaker) { this->speaker_ = speaker; }
+  void set_wake_word_status(text_sensor::TextSensor *sensor) { this->wake_word_status_ = sensor; }
   void set_gateway_url(const std::string &url) { this->gateway_url_ = url; }
   void set_device_id(const std::string &device_id) { this->device_id_ = device_id; }
   void set_enabled(bool enabled) { this->enabled_ = enabled; }
@@ -38,13 +41,17 @@ class NovaRealtime : public Component {
 
   void start_session(const std::string &wake_word);
   void stop_session(const std::string &reason = "device_request");
-  bool is_running() const { return this->session_active_.load(); }
+  void accept_wake();
+  void reject_wake(const std::string &reason = "device_rejected");
+  void set_muted(bool muted);
+  bool is_running() const { return this->session_active_.load() || !this->pending_wake_session_id_.empty(); }
   bool is_connected() const { return this->gateway_ready_.load(); }
 
   Trigger<> *get_connected_trigger() { return &this->connected_trigger_; }
   Trigger<> *get_disconnected_trigger() { return &this->disconnected_trigger_; }
   Trigger<std::string> *get_state_trigger() { return &this->state_trigger_; }
   Trigger<std::string, std::string> *get_error_trigger() { return &this->error_trigger_; }
+  Trigger<std::string, std::string> *get_remote_wake_trigger() { return &this->remote_wake_trigger_; }
 
  protected:
   static constexpr size_t MAX_MESSAGE_BYTES = 2048;
@@ -90,6 +97,12 @@ class NovaRealtime : public Component {
   void send_error_(const std::string &code, const std::string &message);
   void set_state_(const std::string &phase);
   void set_microphone_streaming_(bool enabled);
+  void start_standby_();
+  void stop_standby_(const std::string &status);
+  void apply_wake_configuration_(JsonObjectConst config);
+  void send_wake_status_(const std::string &state);
+  void publish_wake_status_(const std::string &status);
+  void clear_pending_wake_();
   void stop_session_(const std::string &reason, bool error);
   void reset_session_(const std::string &phase);
   void acquire_wifi_performance_();
@@ -100,6 +113,7 @@ class NovaRealtime : public Component {
 
   microphone::MicrophoneSource *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
+  text_sensor::TextSensor *wake_word_status_{nullptr};
   esp_websocket_client_handle_t client_{nullptr};
 
   std::string gateway_url_;
@@ -135,6 +149,7 @@ class NovaRealtime : public Component {
   std::atomic<bool> socket_connected_{false};
   std::atomic<bool> gateway_ready_{false};
   std::atomic<bool> session_active_{false};
+  std::atomic<bool> standby_active_{false};
   std::atomic<bool> incoming_overrun_{false};
   std::atomic<bool> control_overrun_{false};
   std::atomic<bool> tx_transport_fault_{false};
@@ -150,6 +165,8 @@ class NovaRealtime : public Component {
   uint32_t next_connect_at_{0};
   uint32_t connect_delay_ms_{10000};
   uint32_t session_start_deadline_{0};
+  uint32_t pending_wake_deadline_{0};
+  uint32_t wake_generation_{0};
   uint32_t microphone_sequence_{0};
   uint32_t microphone_sample_index_{0};
   uint32_t expected_speaker_sequence_{0};
@@ -174,17 +191,23 @@ class NovaRealtime : public Component {
   uint32_t flush_quiet_since_{0};
   bool wifi_performance_owned_{false};
   bool enabled_{true};
+  bool remote_wake_enabled_{false};
+  bool muted_{false};
   bool hello_pending_{false};
   bool session_stack_reported_{false};
   std::string flush_item_id_;
   std::string current_session_id_;
   std::string current_item_id_;
   std::string last_phase_;
+  std::string pending_wake_session_id_;
+  std::string pending_wake_word_;
+  std::string last_wake_status_;
 
   Trigger<> connected_trigger_;
   Trigger<> disconnected_trigger_;
   Trigger<std::string> state_trigger_;
   Trigger<std::string, std::string> error_trigger_;
+  Trigger<std::string, std::string> remote_wake_trigger_;
 };
 
 template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<NovaRealtime> {
@@ -197,6 +220,25 @@ template<typename... Ts> class StartAction : public Action<Ts...>, public Parent
 template<typename... Ts> class StopAction : public Action<Ts...>, public Parented<NovaRealtime> {
  public:
   void play(const Ts &...x) override { this->parent_->stop_session(); }
+};
+
+template<typename... Ts> class AcceptWakeAction : public Action<Ts...>, public Parented<NovaRealtime> {
+ public:
+  void play(const Ts &...x) override { this->parent_->accept_wake(); }
+};
+
+template<typename... Ts> class RejectWakeAction : public Action<Ts...>, public Parented<NovaRealtime> {
+  TEMPLATABLE_VALUE(std::string, reason)
+
+ public:
+  void play(const Ts &...x) override { this->parent_->reject_wake(this->reason_.value(x...)); }
+};
+
+template<typename... Ts> class SetMutedAction : public Action<Ts...>, public Parented<NovaRealtime> {
+  TEMPLATABLE_VALUE(bool, muted)
+
+ public:
+  void play(const Ts &...x) override { this->parent_->set_muted(this->muted_.value(x...)); }
 };
 
 template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, public Parented<NovaRealtime> {

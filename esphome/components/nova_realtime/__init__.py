@@ -2,13 +2,18 @@ import re
 
 from esphome import automation
 import esphome.codegen as cg
-from esphome.components import esp32, microphone, speaker, wifi
+from esphome.components import esp32, microphone, speaker, text_sensor, wifi
 import esphome.config_validation as cv
-from esphome.const import CONF_ID, CONF_MICROPHONE, CONF_SPEAKER
+from esphome.const import (
+    CONF_ID,
+    CONF_MICROPHONE,
+    CONF_SPEAKER,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+)
 
 
 DEPENDENCIES = ["esp32", "microphone", "network", "speaker", "wifi"]
-AUTO_LOAD = ["audio", "json", "ring_buffer"]
+AUTO_LOAD = ["audio", "json", "ring_buffer", "text_sensor"]
 CODEOWNERS = []
 
 CONF_GATEWAY_URL = "gateway_url"
@@ -19,7 +24,11 @@ CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_STATE = "on_state"
 CONF_ON_ERROR = "on_error"
+CONF_ON_REMOTE_WAKE = "on_remote_wake"
 CONF_WAKE_WORD = "wake_word"
+CONF_WAKE_WORD_STATUS = "wake_word_status"
+CONF_REASON = "reason"
+CONF_MUTED = "muted"
 
 nova_ns = cg.esphome_ns.namespace("nova_realtime")
 NovaRealtime = nova_ns.class_("NovaRealtime", cg.Component)
@@ -28,6 +37,15 @@ StartAction = nova_ns.class_(
 )
 StopAction = nova_ns.class_(
     "StopAction", automation.Action, cg.Parented.template(NovaRealtime)
+)
+AcceptWakeAction = nova_ns.class_(
+    "AcceptWakeAction", automation.Action, cg.Parented.template(NovaRealtime)
+)
+RejectWakeAction = nova_ns.class_(
+    "RejectWakeAction", automation.Action, cg.Parented.template(NovaRealtime)
+)
+SetMutedAction = nova_ns.class_(
+    "SetMutedAction", automation.Action, cg.Parented.template(NovaRealtime)
 )
 IsRunningCondition = nova_ns.class_(
     "IsRunningCondition", automation.Condition, cg.Parented.template(NovaRealtime)
@@ -60,6 +78,10 @@ CONFIG_SCHEMA = cv.Schema(
             max_channels=1,
         ),
         cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
+        cv.Required(CONF_WAKE_WORD_STATUS): text_sensor.text_sensor_schema(
+            icon="mdi:microphone-message",
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
         cv.Required(CONF_GATEWAY_URL): _lan_ws_url,
         cv.Required(CONF_DEVICE_ID): _device_id,
         cv.Optional(CONF_ENABLED, default=True): cv.boolean,
@@ -70,6 +92,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_STATE): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_ERROR): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_REMOTE_WAKE): automation.validate_automation(single=True),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -100,6 +123,8 @@ async def to_code(config):
     cg.add(var.set_microphone_source(mic_source))
     output = await cg.get_variable(config[CONF_SPEAKER])
     cg.add(var.set_speaker(output))
+    wake_status = await text_sensor.new_text_sensor(config[CONF_WAKE_WORD_STATUS])
+    cg.add(var.set_wake_word_status(wake_status))
     cg.add(var.set_gateway_url(config[CONF_GATEWAY_URL]))
     cg.add(var.set_device_id(config[CONF_DEVICE_ID]))
     cg.add(var.set_enabled(config[CONF_ENABLED]))
@@ -120,6 +145,12 @@ async def to_code(config):
             var.get_error_trigger(),
             [(cg.std_string, "code"), (cg.std_string, "message")],
             config[CONF_ON_ERROR],
+        )
+    if CONF_ON_REMOTE_WAKE in config:
+        await automation.build_automation(
+            var.get_remote_wake_trigger(),
+            [(cg.std_string, "session_id"), (cg.std_string, "wake_word")],
+            config[CONF_ON_REMOTE_WAKE],
         )
 
     esp32.add_idf_component(
@@ -153,6 +184,45 @@ async def start_action_to_code(config, action_id, template_arg, args):
 async def stop_action_to_code(config, action_id, template_arg, args):
     var = cg.new_Pvariable(action_id, template_arg)
     await cg.register_parented(var, config[CONF_ID])
+    return var
+
+
+@automation.register_action(
+    "nova_realtime.accept_wake", AcceptWakeAction, NOVA_SCHEMA, synchronous=True
+)
+async def accept_wake_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    return var
+
+
+@automation.register_action(
+    "nova_realtime.reject_wake",
+    RejectWakeAction,
+    NOVA_SCHEMA.extend(
+        {cv.Optional(CONF_REASON, default="device_rejected"): cv.templatable(cv.string)}
+    ),
+    synchronous=True,
+)
+async def reject_wake_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    reason = await cg.templatable(config[CONF_REASON], args, cg.std_string)
+    cg.add(var.set_reason(reason))
+    return var
+
+
+@automation.register_action(
+    "nova_realtime.set_muted",
+    SetMutedAction,
+    NOVA_SCHEMA.extend({cv.Required(CONF_MUTED): cv.templatable(cv.boolean)}),
+    synchronous=True,
+)
+async def set_muted_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    muted = await cg.templatable(config[CONF_MUTED], args, cg.bool_)
+    cg.add(var.set_muted(muted))
     return var
 
 
