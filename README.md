@@ -69,6 +69,11 @@ deliberately has no Assist or timer fallback. If the gateway is unavailable,
 voice wake is unavailable; the center button remains usable once the gateway
 connection returns.
 
+During an active NOVA session the device streams XMOS channel 0 with the
+AEC/IC/NS/AGC pipeline even while assistant audio is playing. This lets the
+gateway's Realtime VAD interrupt playback and recognize conservative standalone
+German/English conversation-stop phrases without a device-local stop model.
+
 See [the documentation](https://voice-pe.home-assistant.io/) for set up and troubleshooting.
 
 If you need to re-install the firmware, [use this installer](https://esphome.github.io/home-assistant-voice-pe/).

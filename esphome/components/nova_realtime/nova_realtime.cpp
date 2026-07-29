@@ -464,9 +464,7 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
     }
     if (this->session_matches_(session_id)) {
       const char *phase = document["phase"] | "unknown";
-      this->set_microphone_streaming_(!this->muted_ && (std::strcmp(phase, "connecting") == 0 ||
-                                                        std::strcmp(phase, "listening") == 0 ||
-                                                        std::strcmp(phase, "user_speaking") == 0));
+      this->set_microphone_streaming_(!this->muted_);
       this->publish_wake_status_(this->muted_ ? "Muted" : "Paused");
       this->set_state_(phase);
     }
@@ -655,8 +653,8 @@ void NovaRealtime::handle_microphone_data_(const std::vector<uint8_t> &data) {
     this->microphone_drops_pending_.fetch_add(1);
   }
   LockGuard lock(this->microphone_mutex_);
-  // The phase may have changed while this callback waited for the buffer.
-  // Avoid carrying one stale speaker-echo frame into the next listening phase.
+  // The session may have ended or the microphone may have been muted while this
+  // callback waited for the buffer.
   if (!this->microphone_streaming_)
     return;
   const size_t free_bytes = this->microphone_buffer_->free();
@@ -1046,13 +1044,9 @@ void NovaRealtime::set_muted(bool muted) {
     return;
   }
   if (this->session_active_) {
-    const bool should_stream = this->last_phase_ == "connecting" || this->last_phase_ == "listening" ||
-                               this->last_phase_ == "user_speaking";
-    if (should_stream) {
-      this->microphone_discontinuity_ = true;
-      this->microphone_->start();
-      this->set_microphone_streaming_(true);
-    }
+    this->microphone_discontinuity_ = true;
+    this->microphone_->start();
+    this->set_microphone_streaming_(true);
     this->send_wake_status_("suspended");
     this->publish_wake_status_("Paused");
   } else {
