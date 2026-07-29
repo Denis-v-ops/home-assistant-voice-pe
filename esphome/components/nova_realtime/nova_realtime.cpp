@@ -25,6 +25,9 @@ static constexpr uint32_t MICROPHONE_DROP_LIMIT = 25;
 static constexpr uint32_t FLUSH_QUIET_MS = 10;
 static constexpr uint32_t LOOP_BUDGET_US = 2000;
 static constexpr size_t LOOP_MESSAGE_BUDGET = 4;
+static constexpr size_t SPEAKER_LOOP_FRAME_BUDGET = 4;
+static constexpr size_t SPEAKER_START_BUFFER_BYTES = 5 * 960;
+static constexpr uint32_t SPEAKER_SOURCE_EMPTY_CONFIRM_MS = 20;
 static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
 // ESP-IDF defines StackType_t as uint8_t and its task stack depth in bytes.
 // Streaming enters the WebSocket send path from this task, so retain ample
@@ -34,6 +37,13 @@ static constexpr uint32_t TX_TASK_STACK_BYTES = 8192;
 static constexpr int WEBSOCKET_TASK_STACK_BYTES = 16384;
 
 static bool deadline_reached(uint32_t now, uint32_t deadline) { return static_cast<int32_t>(now - deadline) >= 0; }
+
+static void update_atomic_max(std::atomic<uint32_t> &target, uint32_t value) {
+  uint32_t current = target.load(std::memory_order_relaxed);
+  while (value > current &&
+         !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+  }
+}
 
 static uint32_t read_be32(const uint8_t *data) {
   return (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) | (uint32_t(data[2]) << 8) | uint32_t(data[3]);
@@ -69,8 +79,13 @@ void NovaRealtime::setup() {
 
   this->microphone_->add_data_callback(
       [this](const std::vector<uint8_t> &data) { this->handle_microphone_data_(data); });
-  this->speaker_->add_audio_output_callback(
-      [this](uint32_t frames, int64_t) { this->played_samples_.fetch_add(frames, std::memory_order_relaxed); });
+  this->speaker_->add_audio_output_callback([this](uint32_t frames, int64_t) {
+    this->played_samples_.fetch_add(frames, std::memory_order_relaxed);
+    const uint32_t now = millis();
+    const uint32_t previous = this->speaker_last_callback_ms_.exchange(now, std::memory_order_relaxed);
+    if (previous != 0)
+      update_atomic_max(this->speaker_max_callback_gap_ms_, now - previous);
+  });
 
   if (!this->tx_task_handle_.create(NovaRealtime::tx_task_, "nova_tx", TX_TASK_STACK_BYTES, this, TX_TASK_PRIORITY,
                                      false)) {
@@ -89,9 +104,10 @@ void NovaRealtime::dump_config() {
                 "  Enabled: %s\n"
                 "  Initial connect delay: %" PRIu32 " ms\n"
                 "  Gateway: %s\n"
-                "  Device ID: %s\n"
-                "  Playback window: 300 ms\n"
-                "  Speaker buffer: 400 ms\n"
+                 "  Device ID: %s\n"
+                 "  Playback window: 300 ms\n"
+                 "  Playback startup buffer: 100 ms\n"
+                 "  Speaker buffer: 400 ms\n"
                 "  Microphone buffer: 500 ms\n"
                 "  Remote wake: gateway-only Hey Nova (English/German)\n"
                 "  Transport: trusted LAN WebSocket",
@@ -484,7 +500,7 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
       this->stop_session_("invalid_item", true);
       return;
     }
-    if (!this->current_item_id_.empty() && this->current_item_id_ != next_item_id)
+    if (!this->current_item_id_.empty())
       this->speaker_->stop();
     this->speaker_buffer_->reset();
     this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
@@ -495,9 +511,14 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
     this->total_speaker_samples_ = 0;
     this->finish_requested_ = this->finish_called_ = this->drained_reported_ = false;
     this->flush_requested_ = false;
+    this->speaker_started_ = false;
+    this->speaker_source_empty_ = false;
+    this->speaker_source_empty_reported_ = false;
+    this->speaker_source_empty_since_ = 0;
+    this->speaker_start_buffered_bytes_ = 0;
+    this->speaker_last_callback_ms_.store(0, std::memory_order_relaxed);
     this->flush_item_id_.clear();
     this->speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, 24000));
-    this->speaker_->start();
   } else if (std::strcmp(type, "audio.end") == 0) {
     if (!this->session_matches_(document["session_id"] | "") ||
         this->current_item_id_ != std::string(document["item_id"] | "") || this->flush_requested_)
@@ -509,6 +530,9 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
     }
     this->total_speaker_samples_ = total;
     this->finish_requested_ = true;
+    this->speaker_source_empty_ = false;
+    this->speaker_source_empty_reported_ = false;
+    this->speaker_source_empty_since_ = 0;
   } else if (std::strcmp(type, "audio.flush") == 0) {
     if (!this->session_matches_(document["session_id"] | "") ||
         this->current_item_id_ != std::string(document["item_id"] | ""))
@@ -517,6 +541,11 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
     this->speaker_buffer_->reset();
     this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
     this->speaker_->stop();
+    this->speaker_started_ = false;
+    this->speaker_source_empty_ = false;
+    this->speaker_source_empty_reported_ = false;
+    this->speaker_source_empty_since_ = 0;
+    this->speaker_last_callback_ms_.store(0, std::memory_order_relaxed);
     this->flush_requested_ = true;
     this->flush_item_id_ = item_id;
     this->flush_last_played_samples_ = this->played_samples_.load(std::memory_order_relaxed);
@@ -563,18 +592,63 @@ void NovaRealtime::handle_audio_(const uint8_t *payload, size_t length) {
 void NovaRealtime::process_speaker_() {
   if (this->current_item_id_.empty() || this->flush_requested_)
     return;
-  if (this->speaker_frame_offset_ >= this->speaker_frame_length_) {
-    this->speaker_frame_length_ =
-        this->speaker_buffer_->read(this->speaker_frame_.data(), SPEAKER_FRAME_BYTES, 0);
-    this->speaker_frame_offset_ = 0;
+  if (!this->speaker_started_) {
+    const size_t buffered = this->speaker_buffer_->available();
+    if (buffered == 0 || (buffered < SPEAKER_START_BUFFER_BYTES && !this->finish_requested_))
+      return;
+    this->speaker_start_buffered_bytes_ = buffered;
+    this->speaker_source_empty_ = false;
+    this->speaker_source_empty_reported_ = false;
+    this->speaker_source_empty_since_ = 0;
+    this->speaker_last_callback_ms_.store(0, std::memory_order_relaxed);
+    this->speaker_->start();
+    this->speaker_started_ = true;
   }
-  if (this->speaker_frame_length_ == 0)
-    return;
-  const size_t written = this->speaker_->play(this->speaker_frame_.data() + this->speaker_frame_offset_,
-                                              this->speaker_frame_length_ - this->speaker_frame_offset_, 0);
-  this->speaker_frame_offset_ += written;
-  if (this->speaker_frame_offset_ >= this->speaker_frame_length_)
-    this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
+
+  const uint32_t started = micros();
+  size_t frames_started = this->speaker_frame_length_ > this->speaker_frame_offset_ ? 1 : 0;
+  while (frames_started < SPEAKER_LOOP_FRAME_BUDGET && micros() - started < LOOP_BUDGET_US) {
+    if (this->speaker_frame_offset_ >= this->speaker_frame_length_) {
+      this->speaker_frame_length_ =
+          this->speaker_buffer_->read(this->speaker_frame_.data(), SPEAKER_FRAME_BYTES, 0);
+      this->speaker_frame_offset_ = 0;
+      if (this->speaker_frame_length_ == 0) {
+        if (!this->finish_requested_) {
+          const uint32_t now = millis();
+          if (!this->speaker_source_empty_) {
+            this->speaker_source_empty_ = true;
+            this->speaker_source_empty_reported_ = false;
+            this->speaker_source_empty_since_ = now;
+          } else if (!this->speaker_source_empty_reported_ &&
+                     now - this->speaker_source_empty_since_ >= SPEAKER_SOURCE_EMPTY_CONFIRM_MS) {
+            this->speaker_source_empty_reported_ = true;
+            this->speaker_source_empty_transitions_++;
+            ESP_LOGD(TAG, "Speaker source empty for at least one frame before audio.end");
+          }
+        }
+        return;
+      }
+      this->speaker_source_empty_ = false;
+      this->speaker_source_empty_reported_ = false;
+      this->speaker_source_empty_since_ = 0;
+      frames_started++;
+    }
+
+    const size_t remaining = this->speaker_frame_length_ - this->speaker_frame_offset_;
+    const size_t written =
+        this->speaker_->play(this->speaker_frame_.data() + this->speaker_frame_offset_, remaining, 0);
+    if (written == 0) {
+      this->speaker_zero_writes_++;
+      return;
+    }
+    if (written < remaining)
+      this->speaker_partial_writes_++;
+    this->speaker_frame_offset_ += written;
+    if (this->speaker_frame_offset_ >= this->speaker_frame_length_)
+      this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
+    if (written < remaining)
+      return;
+  }
 }
 
 void NovaRealtime::process_flush_() {
@@ -611,6 +685,11 @@ void NovaRealtime::process_finish_() {
     this->finish_called_ = true;
   }
   if (this->finish_called_ && this->speaker_->is_stopped() && !this->drained_reported_) {
+    this->speaker_started_ = false;
+    this->speaker_source_empty_ = false;
+    this->speaker_source_empty_reported_ = false;
+    this->speaker_source_empty_since_ = 0;
+    this->speaker_last_callback_ms_.store(0, std::memory_order_relaxed);
     // The resampler callback counts source-equivalent DAC frames. Its filter
     // shutdown may under-count the original 24 kHz input by a small amount,
     // even though every buffer has drained. At this point graceful finish is
@@ -907,6 +986,11 @@ void NovaRealtime::reset_session_(const std::string &phase) {
   if (this->speaker_buffer_ != nullptr)
     this->speaker_buffer_->reset();
   this->speaker_frame_length_ = this->speaker_frame_offset_ = 0;
+  this->speaker_started_ = false;
+  this->speaker_source_empty_ = false;
+  this->speaker_source_empty_reported_ = false;
+  this->speaker_source_empty_since_ = 0;
+  this->speaker_last_callback_ms_.store(0, std::memory_order_relaxed);
   this->finish_requested_ = this->finish_called_ = this->drained_reported_ = false;
   this->flush_requested_ = false;
   this->flush_item_id_.clear();
@@ -1104,6 +1188,12 @@ void NovaRealtime::send_pong_(uint64_t timestamp_ms) {
   diagnostics["free_psram_bytes"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
   diagnostics["rx_high_water_bytes"] = rx_high_water_bytes;
   diagnostics["speaker_high_water_bytes"] = this->speaker_high_water_bytes_;
+  diagnostics["speaker_source_empty_transitions"] = this->speaker_source_empty_transitions_;
+  diagnostics["speaker_zero_writes"] = this->speaker_zero_writes_;
+  diagnostics["speaker_partial_writes"] = this->speaker_partial_writes_;
+  diagnostics["speaker_max_callback_gap_ms"] =
+      this->speaker_max_callback_gap_ms_.load(std::memory_order_relaxed);
+  diagnostics["speaker_start_buffered_bytes"] = this->speaker_start_buffered_bytes_;
   diagnostics["mic_high_water_bytes"] = microphone_high_water_bytes;
   diagnostics["loop_max_us"] = this->max_loop_us_;
   diagnostics["microphone_drops"] = this->microphone_drops_total_;

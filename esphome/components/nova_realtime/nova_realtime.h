@@ -160,6 +160,8 @@ class NovaRealtime : public Component {
   std::atomic<uint32_t> played_samples_{0};
   std::atomic<uint32_t> microphone_callback_count_{0};
   std::atomic<uint32_t> microphone_callback_stack_low_water_bytes_{0xFFFFFFFFUL};
+  std::atomic<uint32_t> speaker_last_callback_ms_{0};
+  std::atomic<uint32_t> speaker_max_callback_gap_ms_{0};
 
   SessionState session_state_{SessionState::IDLE};
   uint32_t next_connect_at_{0};
@@ -180,9 +182,17 @@ class NovaRealtime : public Component {
   std::atomic<uint32_t> reconnect_count_{0};
   uint32_t rx_high_water_bytes_{0};
   uint32_t speaker_high_water_bytes_{0};
+  uint32_t speaker_source_empty_transitions_{0};
+  uint32_t speaker_zero_writes_{0};
+  uint32_t speaker_partial_writes_{0};
+  uint32_t speaker_start_buffered_bytes_{0};
+  uint32_t speaker_source_empty_since_{0};
   uint32_t microphone_high_water_bytes_{0};
   uint32_t max_loop_us_{0};
   bool speaker_sequence_initialized_{false};
+  bool speaker_started_{false};
+  bool speaker_source_empty_{false};
+  bool speaker_source_empty_reported_{false};
   bool finish_requested_{false};
   bool finish_called_{false};
   bool drained_reported_{false};

@@ -7,7 +7,9 @@ Realtime device protocol. While unmuted, 16 kHz mono PCM streams continuously
 over the trusted home LAN to the Portainer gateway in the sibling
 `gladosAgent` repository, where the fixed bilingual **Hey Nova** model runs.
 Idle audio is not stored or sent to OpenAI; only audio after an accepted wake
-handoff enters a realtime session.
+handoff enters a realtime session. The gateway suppresses provider microphone
+input during NOVA playback by default; full-duplex barge-in is an explicit
+gateway opt-in.
 
 This repository is designed to be loaded as a remote ESPHome package. Its
 external components are cloned from this repository and its embedded sounds are
