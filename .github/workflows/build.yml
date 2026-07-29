@@ -14,9 +14,9 @@ concurrency:
 jobs:
   build-firmware:
     name: Validate Realtime firmware
-    uses: esphome/workflows/.github/workflows/build.yml@2026.7.0
+    uses: esphome/workflows/.github/workflows/build.yml@2026.7.3
     with:
       # This overlay supplies non-production credentials and Wi-Fi solely so
       # CI can compile the otherwise dashboard-managed configuration.
       files: .github/ci/home-assistant-voice.yaml
-      esphome-version: 2026.7.0
+      esphome-version: 2026.7.3
