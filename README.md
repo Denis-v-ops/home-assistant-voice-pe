@@ -23,18 +23,18 @@ then map them into the package from the device YAML:
 substitutions:
   nova_gateway_url: !secret nova_gateway_url
   nova_device_id: !secret nova_device_id
-  nova_repo_ref: nova-v0.3.0
+  nova_repo_ref: nova-v0.4.0
   nova_components_refresh: 1d
 
 packages:
   nova_voice_pe:
     url: https://github.com/Denis-v-ops/home-assistant-voice-PE
     file: home-assistant-voice.yaml
-    ref: nova-v0.3.0
+    ref: nova-v0.4.0
 
 ```
 
-The package now loads `voice_kit` and `nova_realtime` itself. `nova-v0.3.0` is
+The package now loads `voice_kit` and `nova_realtime` itself. `nova-v0.4.0` is
 the immutable coordinated-release tag; publish it from the reviewed firmware
 commit before using this production wrapper. Pre-release CI overrides the
 component source and sound path with checked-out local files. Development
@@ -65,11 +65,15 @@ logs can attach before transport startup. For a longer diagnostic window,
 override `nova_connect_delay_ms` with a value up to `60000`.
 
 The center button or **Hey Nova** starts NOVA. The center button rejects a
-pending wake or interrupts an active session. There is no microWakeWord, local
-wake/stop model, phrase catalog, or sensitivity setting, and the device
-deliberately has no Assist or timer fallback. If the gateway is unavailable,
-voice wake is unavailable; the center button remains usable once the gateway
-connection returns.
+pending wake or interrupts an active session. Timer-alert-capable firmware
+plays the bundled alarm cue on the device; pressing the center button during
+that cue dismisses it. The gateway follows a completed cue with Nova's short
+spoken notification. There is no microWakeWord, local wake/stop model, phrase
+catalog, sensitivity setting, or Assist fallback. The durable timer schedule
+lives in Home Assistant, so an unavailable gateway cannot deliver an alarm
+until connectivity returns and its five-minute notification window is still
+open. Voice wake is likewise unavailable while the gateway is down; the center
+button remains usable once the gateway connection returns.
 
 During an active NOVA session the device streams XMOS channel 0 with the
 AEC/IC/NS/AGC pipeline even while assistant audio is playing. This lets the

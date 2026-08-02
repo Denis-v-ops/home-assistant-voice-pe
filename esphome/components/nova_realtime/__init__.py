@@ -25,10 +25,12 @@ CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_STATE = "on_state"
 CONF_ON_ERROR = "on_error"
 CONF_ON_REMOTE_WAKE = "on_remote_wake"
+CONF_ON_TIMER_ALERT = "on_timer_alert"
 CONF_WAKE_WORD = "wake_word"
 CONF_WAKE_WORD_STATUS = "wake_word_status"
 CONF_REASON = "reason"
 CONF_MUTED = "muted"
+CONF_OUTCOME = "outcome"
 
 nova_ns = cg.esphome_ns.namespace("nova_realtime")
 NovaRealtime = nova_ns.class_("NovaRealtime", cg.Component)
@@ -47,11 +49,19 @@ RejectWakeAction = nova_ns.class_(
 SetMutedAction = nova_ns.class_(
     "SetMutedAction", automation.Action, cg.Parented.template(NovaRealtime)
 )
+CompleteTimerAlertAction = nova_ns.class_(
+    "CompleteTimerAlertAction", automation.Action, cg.Parented.template(NovaRealtime)
+)
 IsRunningCondition = nova_ns.class_(
     "IsRunningCondition", automation.Condition, cg.Parented.template(NovaRealtime)
 )
 IsConnectedCondition = nova_ns.class_(
     "IsConnectedCondition", automation.Condition, cg.Parented.template(NovaRealtime)
+)
+TimerAlertActiveCondition = nova_ns.class_(
+    "TimerAlertActiveCondition",
+    automation.Condition,
+    cg.Parented.template(NovaRealtime),
 )
 
 
@@ -93,6 +103,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_STATE): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_ERROR): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_REMOTE_WAKE): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_TIMER_ALERT): automation.validate_automation(single=True),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -151,6 +162,10 @@ async def to_code(config):
             var.get_remote_wake_trigger(),
             [(cg.std_string, "session_id"), (cg.std_string, "wake_word")],
             config[CONF_ON_REMOTE_WAKE],
+        )
+    if CONF_ON_TIMER_ALERT in config:
+        await automation.build_automation(
+            var.get_timer_alert_trigger(), [], config[CONF_ON_TIMER_ALERT]
         )
 
     esp32.add_idf_component(
@@ -226,6 +241,26 @@ async def set_muted_action_to_code(config, action_id, template_arg, args):
     return var
 
 
+@automation.register_action(
+    "nova_realtime.complete_timer_alert",
+    CompleteTimerAlertAction,
+    NOVA_SCHEMA.extend(
+        {
+            cv.Required(CONF_OUTCOME): cv.templatable(
+                cv.one_of("played", "dismissed", "failed", lower=True)
+            )
+        }
+    ),
+    synchronous=True,
+)
+async def complete_timer_alert_action_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    outcome = await cg.templatable(config[CONF_OUTCOME], args, cg.std_string)
+    cg.add(var.set_outcome(outcome))
+    return var
+
+
 @automation.register_condition("nova_realtime.is_running", IsRunningCondition, NOVA_SCHEMA)
 async def is_running_to_code(config, condition_id, template_arg, args):
     var = cg.new_Pvariable(condition_id, template_arg)
@@ -235,6 +270,15 @@ async def is_running_to_code(config, condition_id, template_arg, args):
 
 @automation.register_condition("nova_realtime.connected", IsConnectedCondition, NOVA_SCHEMA)
 async def is_connected_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
+    return var
+
+
+@automation.register_condition(
+    "nova_realtime.timer_alert_active", TimerAlertActiveCondition, NOVA_SCHEMA
+)
+async def timer_alert_active_to_code(config, condition_id, template_arg, args):
     var = cg.new_Pvariable(condition_id, template_arg)
     await cg.register_parented(var, config[CONF_ID])
     return var

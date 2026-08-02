@@ -244,35 +244,48 @@ binary_sensor:
               then:
                 - if:
                     condition:
-                      nova_realtime.is_running:
+                      nova_realtime.timer_alert_active:
                     then:
-                      - nova_realtime.stop:
-                    else:
                       - if:
                           condition:
                             media_player.is_announcing:
                           then:
-                            media_player.stop:
-                              announcement: true
+                            - media_player.stop:
+                                announcement: true
+                      - nova_realtime.complete_timer_alert:
+                          outcome: dismissed
+                    else:
+                      - if:
+                          condition:
+                            nova_realtime.is_running:
+                          then:
+                            - nova_realtime.stop:
                           else:
                             - if:
                                 condition:
-                                  media_player.is_playing:
+                                  media_player.is_announcing:
                                 then:
-                                  - media_player.pause:
+                                  media_player.stop:
+                                    announcement: true
                                 else:
                                   - if:
                                       condition:
-                                        and:
-                                          - switch.is_off: master_mute_switch
-                                          - nova_realtime.connected:
+                                        media_player.is_playing:
                                       then:
-                                        - script.execute:
-                                            id: play_sound
-                                            priority: true
-                                            sound_file: !lambda return id(center_button_press_sound);
-                                        - delay: 300ms
-                                        - nova_realtime.start:
+                                        - media_player.pause:
+                                      else:
+                                        - if:
+                                            condition:
+                                              and:
+                                                - switch.is_off: master_mute_switch
+                                                - nova_realtime.connected:
+                                            then:
+                                              - script.execute:
+                                                  id: play_sound
+                                                  priority: true
+                                                  sound_file: !lambda return id(center_button_press_sound);
+                                              - delay: 300ms
+                                              - nova_realtime.start:
       # Double Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -1203,6 +1216,32 @@ script:
               ->play_file(sound_file, true, false);
           }
 
+  # Play one bundled timer cue, then notify the gateway so Nova can speak its name.
+  - id: play_timer_alert
+    mode: restart
+    then:
+      - script.execute:
+          id: play_sound
+          priority: true
+          sound_file: !lambda return id(timer_finished_sound);
+      - delay: 100ms
+      - wait_until:
+          condition:
+            not:
+              media_player.is_announcing:
+          timeout: 15s
+      - if:
+          condition:
+            media_player.is_announcing:
+          then:
+            - media_player.stop:
+                announcement: true
+            - nova_realtime.complete_timer_alert:
+                outcome: failed
+          else:
+            - nova_realtime.complete_timer_alert:
+                outcome: played
+
   - id: play_random_wake
     then:
       - script.execute:
@@ -1217,7 +1256,9 @@ script:
             };
             size_t n = sizeof(files) / sizeof(files[0]);
             // use ESP32’s RNG
-            return files[esp_random() % n];
+            size_t selected = esp_random() % n;
+            id(nova_rt).set_last_wake_cue(selected + 1);
+            return files[selected];
       - delay: 1000ms
 
 i2s_audio:
@@ -1312,10 +1353,23 @@ media_player:
       sample_rate: 48000
     on_mute:
       - script.execute: control_leds
+      - lambda: |-
+          id(nova_rt).set_shared_output_state(
+            id(external_media_player).volume, true
+          );
     on_unmute:
       - script.execute: control_leds
+      - lambda: |-
+          id(nova_rt).set_shared_output_state(
+            id(external_media_player).volume, false
+          );
     on_volume:
       - script.execute: control_leds
+      - lambda: |-
+          id(nova_rt).set_shared_output_state(
+            id(external_media_player).volume,
+            id(external_media_player).is_muted()
+          );
     on_announcement:
       - mixer_speaker.apply_ducking:
           id: media_mixing_input
@@ -1357,6 +1411,8 @@ media_player:
         file: ${sounds_base_url}/mute_switch_on.flac
       - id: mute_switch_off_sound
         file: ${sounds_base_url}/mute_switch_off.flac
+      - id: timer_finished_sound
+        file: ${sounds_base_url}/timer_finished.flac
       - id: easter_egg_tick_sound
         file: ${sounds_base_url}/easter_egg_tick.mp3
       - id: easter_egg_tada_sound
@@ -1410,6 +1466,11 @@ nova_realtime:
         id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - nova_realtime.set_muted:
         muted: !lambda return id(master_mute_switch).state;
+    - lambda: |-
+        id(nova_rt).set_shared_output_state(
+          id(external_media_player).volume,
+          id(external_media_player).is_muted()
+        );
     - script.execute: control_leds
   on_disconnected:
     - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
@@ -1424,20 +1485,37 @@ nova_realtime:
         else:
           - if:
               condition:
-                media_player.is_announcing:
+                nova_realtime.timer_alert_active:
               then:
-                - media_player.stop:
-                    announcement: true
+                - if:
+                    condition:
+                      media_player.is_announcing:
+                    then:
+                      - media_player.stop:
+                          announcement: true
+                - nova_realtime.complete_timer_alert:
+                    outcome: dismissed
                 - nova_realtime.reject_wake:
-                    reason: announcement
+                    reason: timer_alert_dismissed
               else:
                 - if:
                     condition:
-                      switch.is_on: wake_sound
+                      media_player.is_announcing:
                     then:
-                      - script.execute: play_random_wake
-                      - delay: 300ms
-                - nova_realtime.accept_wake:
+                      - media_player.stop:
+                          announcement: true
+                      - nova_realtime.reject_wake:
+                          reason: announcement
+                    else:
+                      - if:
+                          condition:
+                            switch.is_on: wake_sound
+                          then:
+                            - script.execute: play_random_wake
+                            - delay: 300ms
+                      - nova_realtime.accept_wake:
+  on_timer_alert:
+    - script.execute: play_timer_alert
   on_state:
     - lambda: |-
         if (phase == "armed") {

@@ -12,6 +12,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  validate-wake-audio:
+    name: Validate wake audio mastering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
+      - name: Check format, loudness, true peak, and clipping
+        run: python scripts/validate_wake_audio.py
+
   build-firmware:
     name: Validate Realtime firmware
     uses: esphome/workflows/.github/workflows/build.yml@2026.7.3

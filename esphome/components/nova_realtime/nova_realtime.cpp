@@ -279,6 +279,8 @@ void NovaRealtime::disconnect_() {
   this->socket_connected_ = false;
   this->remote_wake_enabled_ = false;
   this->wake_generation_ = 0;
+  this->timer_alert_active_ = false;
+  this->timer_alert_notification_id_.clear();
   if (this->control_queue_ != nullptr)
     xQueueReset(this->control_queue_);
   {
@@ -391,6 +393,7 @@ bool NovaRealtime::queue_hello_() {
   std::snprintf(boot_id, sizeof(boot_id), "%08" PRIx32, esp_random());
   hello["boot_id"] = boot_id;
   hello["capabilities"]["remote_wake"] = 1;
+  hello["capabilities"]["timer_alert"] = 1;
   hello["output_flow"]["mode"] = "played_window";
   hello["output_flow"]["max_inflight_samples"] = 7200;
   hello["output_flow"]["played_report_interval_samples"] = PLAYED_REPORT_INTERVAL;
@@ -467,6 +470,26 @@ void NovaRealtime::handle_control_(const uint8_t *payload, size_t length) {
     }
   } else if (std::strcmp(type, "ping") == 0) {
     this->send_pong_(document["timestamp_ms"] | uint64_t(0));
+  } else if (std::strcmp(type, "timer.alert") == 0) {
+    const std::string notification_id = document["notification_id"] | "";
+    if (notification_id.size() != 36) {
+      this->send_error_("invalid_timer_alert", "Timer alert notification ID is invalid");
+      return;
+    }
+    if (this->timer_alert_active_ || this->session_state_ != SessionState::IDLE ||
+        !this->pending_wake_session_id_.empty()) {
+      JsonDocument response;
+      response["type"] = "timer.alert_done";
+      response["notification_id"] = notification_id;
+      response["outcome"] = "failed";
+      std::string encoded;
+      serializeJson(response, encoded);
+      this->queue_control_(encoded);
+      return;
+    }
+    this->timer_alert_active_ = true;
+    this->timer_alert_notification_id_ = notification_id;
+    this->timer_alert_trigger_.trigger();
   } else if (std::strcmp(type, "state") == 0) {
     const char *session_id = document["session_id"] | "";
     if (this->current_session_id_.empty()) {
@@ -858,7 +881,8 @@ void NovaRealtime::start_session(const std::string &wake_word) {
     this->send_error_("gateway_unavailable", "Realtime gateway is not connected");
     return;
   }
-  if (this->session_state_ != SessionState::IDLE || !this->pending_wake_session_id_.empty() || this->muted_)
+  if (this->session_state_ != SessionState::IDLE || !this->pending_wake_session_id_.empty() ||
+      this->timer_alert_active_ || this->muted_)
     return;
   this->stop_standby_("Paused");
   this->current_session_id_ = this->new_session_id_();
@@ -953,6 +977,16 @@ void NovaRealtime::stop_session(const std::string &reason) {
     return;
   }
   this->stop_session_(reason, false);
+}
+
+void NovaRealtime::complete_timer_alert(const std::string &outcome) {
+  if (!this->timer_alert_active_)
+    return;
+  if (outcome != "played" && outcome != "dismissed" && outcome != "failed") {
+    this->send_error_("invalid_timer_alert_outcome", "Timer alert outcome is invalid");
+    return;
+  }
+  this->send_timer_alert_done_(outcome);
 }
 
 void NovaRealtime::stop_session_(const std::string &reason, bool error) {
@@ -1199,6 +1233,9 @@ void NovaRealtime::send_pong_(uint64_t timestamp_ms) {
   diagnostics["microphone_drops"] = this->microphone_drops_total_;
   diagnostics["transport_faults"] = this->transport_faults_total_;
   diagnostics["reconnects"] = this->reconnect_count_.load(std::memory_order_relaxed);
+  diagnostics["wake_cue"] = this->last_wake_cue_;
+  diagnostics["shared_output_volume_per_mille"] = this->shared_output_volume_per_mille_;
+  diagnostics["shared_output_muted"] = this->shared_output_muted_ ? 1 : 0;
   diagnostics["tx_stack_low_water_bytes"] =
       this->tx_task_handle_.is_created()
           ? uxTaskGetStackHighWaterMark(this->tx_task_handle_.get_handle())
@@ -1211,6 +1248,18 @@ void NovaRealtime::send_pong_(uint64_t timestamp_ms) {
   std::string encoded;
   serializeJson(pong, encoded);
   this->queue_control_(encoded);
+}
+
+void NovaRealtime::send_timer_alert_done_(const std::string &outcome) {
+  JsonDocument response;
+  response["type"] = "timer.alert_done";
+  response["notification_id"] = this->timer_alert_notification_id_;
+  response["outcome"] = outcome;
+  std::string encoded;
+  serializeJson(response, encoded);
+  this->queue_control_(encoded);
+  this->timer_alert_active_ = false;
+  this->timer_alert_notification_id_.clear();
 }
 
 void NovaRealtime::send_error_(const std::string &code, const std::string &message) {

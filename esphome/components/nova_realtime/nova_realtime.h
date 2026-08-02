@@ -44,14 +44,23 @@ class NovaRealtime : public Component {
   void accept_wake();
   void reject_wake(const std::string &reason = "device_rejected");
   void set_muted(bool muted);
+  void complete_timer_alert(const std::string &outcome);
+  void set_last_wake_cue(uint8_t cue) { this->last_wake_cue_ = cue; }
+  void set_shared_output_state(float volume, bool muted) {
+    const float bounded_volume = volume < 0.0f ? 0.0f : (volume > 1.0f ? 1.0f : volume);
+    this->shared_output_volume_per_mille_ = static_cast<uint16_t>(bounded_volume * 1000.0f + 0.5f);
+    this->shared_output_muted_ = muted;
+  }
   bool is_running() const { return this->session_active_.load() || !this->pending_wake_session_id_.empty(); }
   bool is_connected() const { return this->gateway_ready_.load(); }
+  bool is_timer_alert_active() const { return this->timer_alert_active_; }
 
   Trigger<> *get_connected_trigger() { return &this->connected_trigger_; }
   Trigger<> *get_disconnected_trigger() { return &this->disconnected_trigger_; }
   Trigger<std::string> *get_state_trigger() { return &this->state_trigger_; }
   Trigger<std::string, std::string> *get_error_trigger() { return &this->error_trigger_; }
   Trigger<std::string, std::string> *get_remote_wake_trigger() { return &this->remote_wake_trigger_; }
+  Trigger<> *get_timer_alert_trigger() { return &this->timer_alert_trigger_; }
 
  protected:
   static constexpr size_t MAX_MESSAGE_BYTES = 2048;
@@ -110,6 +119,7 @@ class NovaRealtime : public Component {
   std::string new_session_id_();
   bool session_matches_(const char *session_id) const;
   void send_pong_(uint64_t timestamp_ms);
+  void send_timer_alert_done_(const std::string &outcome);
 
   microphone::MicrophoneSource *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
@@ -203,6 +213,10 @@ class NovaRealtime : public Component {
   bool enabled_{true};
   bool remote_wake_enabled_{false};
   bool muted_{false};
+  bool shared_output_muted_{false};
+  bool timer_alert_active_{false};
+  uint8_t last_wake_cue_{0};
+  uint16_t shared_output_volume_per_mille_{0};
   bool hello_pending_{false};
   bool session_stack_reported_{false};
   std::string flush_item_id_;
@@ -212,12 +226,14 @@ class NovaRealtime : public Component {
   std::string pending_wake_session_id_;
   std::string pending_wake_word_;
   std::string last_wake_status_;
+  std::string timer_alert_notification_id_;
 
   Trigger<> connected_trigger_;
   Trigger<> disconnected_trigger_;
   Trigger<std::string> state_trigger_;
   Trigger<std::string, std::string> error_trigger_;
   Trigger<std::string, std::string> remote_wake_trigger_;
+  Trigger<> timer_alert_trigger_;
 };
 
 template<typename... Ts> class StartAction : public Action<Ts...>, public Parented<NovaRealtime> {
@@ -251,6 +267,13 @@ template<typename... Ts> class SetMutedAction : public Action<Ts...>, public Par
   void play(const Ts &...x) override { this->parent_->set_muted(this->muted_.value(x...)); }
 };
 
+template<typename... Ts> class CompleteTimerAlertAction : public Action<Ts...>, public Parented<NovaRealtime> {
+  TEMPLATABLE_VALUE(std::string, outcome)
+
+ public:
+  void play(const Ts &...x) override { this->parent_->complete_timer_alert(this->outcome_.value(x...)); }
+};
+
 template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, public Parented<NovaRealtime> {
  public:
   bool check(const Ts &...x) override { return this->parent_->is_running(); }
@@ -259,6 +282,11 @@ template<typename... Ts> class IsRunningCondition : public Condition<Ts...>, pub
 template<typename... Ts> class IsConnectedCondition : public Condition<Ts...>, public Parented<NovaRealtime> {
  public:
   bool check(const Ts &...x) override { return this->parent_->is_connected(); }
+};
+
+template<typename... Ts> class TimerAlertActiveCondition : public Condition<Ts...>, public Parented<NovaRealtime> {
+ public:
+  bool check(const Ts &...x) override { return this->parent_->is_timer_alert_active(); }
 };
 
 }  // namespace esphome::nova_realtime
