@@ -80,6 +80,10 @@ esp32:
 wifi:
   id: wifi_id
   fast_connect: ${hidden_ssid}
+  # The device is mains powered and streams standby audio to the gateway
+  # around the clock; modem sleep stalled that stream and dropped the
+  # WebSocket several times a day, eating wake words.
+  power_save_mode: none
   on_connect:
     - lambda: id(improv_ble_in_progress) = false;
     - script.execute: control_leds
