@@ -19,7 +19,9 @@ static constexpr size_t MICROPHONE_BUFFER_BYTES = 16000;
 static constexpr size_t SPEAKER_BUFFER_BYTES = 19200;
 static constexpr uint32_t PLAYED_REPORT_INTERVAL = 960;
 static constexpr uint32_t SESSION_START_TIMEOUT_MS = 20000;
-static constexpr uint32_t PENDING_WAKE_TIMEOUT_MS = 1500;
+// Must cover the longest wake chime (1.7 s) plus the settling delay before
+// acceptance, and stay below the gateway's three-second pending window.
+static constexpr uint32_t PENDING_WAKE_TIMEOUT_MS = 2800;
 static constexpr uint32_t MICROPHONE_DROP_WINDOW_MS = 5000;
 static constexpr uint32_t MICROPHONE_DROP_LIMIT = 25;
 static constexpr uint32_t FLUSH_QUIET_MS = 10;

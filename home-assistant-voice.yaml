@@ -1512,7 +1512,16 @@ nova_realtime:
                             switch.is_on: wake_sound
                           then:
                             - script.execute: play_random_wake
-                            - delay: 300ms
+                            # Open the microphone only after the chime has
+                            # finished: its residual echo otherwise reaches
+                            # the model as a phantom first turn.
+                            - delay: 100ms
+                            - wait_until:
+                                condition:
+                                  not:
+                                    media_player.is_announcing:
+                                timeout: 2s
+                            - delay: 150ms
                       - nova_realtime.accept_wake:
   on_timer_alert:
     - script.execute: play_timer_alert
