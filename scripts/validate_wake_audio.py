@@ -13,6 +13,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 WAKE_DIR = ROOT / "sounds" / "wake"
 EXPECTED_FILES = {"1.flac", "2.flac", "3.flac", "4.flac"}
+# These files use the local announcement pipeline, not the 24 kHz Live stream.
+EXPECTED_SAMPLE_RATE = "48000"
 LOUDNESS_MIN = -20.5
 LOUDNESS_MAX = -19.5
 TRUE_PEAK_MAX = -3.0
@@ -48,8 +50,10 @@ def validate(path: Path) -> list[str]:
     )["streams"][0]
     if probe.get("codec_name") != "flac":
         failures.append(f"codec={probe.get('codec_name')!r}, expected FLAC")
-    if probe.get("sample_rate") != "24000":
-        failures.append(f"sample_rate={probe.get('sample_rate')!r}, expected 24000")
+    if probe.get("sample_rate") != EXPECTED_SAMPLE_RATE:
+        failures.append(
+            f"sample_rate={probe.get('sample_rate')!r}, expected {EXPECTED_SAMPLE_RATE}"
+        )
     if probe.get("channels") != 1:
         failures.append(f"channels={probe.get('channels')!r}, expected mono")
 
@@ -101,7 +105,7 @@ def validate(path: Path) -> list[str]:
         failures.append(f"full-scale samples={clipped_samples}")
 
     print(
-        f"{path.name}: 24 kHz mono FLAC, {loudness:.1f} LUFS, "
+        f"{path.name}: {probe.get('sample_rate')} Hz mono FLAC, {loudness:.1f} LUFS, "
         f"{true_peak:.1f} dBTP, clipped_samples={clipped_samples}"
     )
     return failures
