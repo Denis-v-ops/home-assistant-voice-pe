@@ -24,7 +24,8 @@ jobs:
 
   build-firmware:
     name: Validate Realtime firmware
-    uses: esphome/workflows/.github/workflows/build.yml@2026.7.3
+    # Workflow releases use the minor .0 tag; the compiler version is separate.
+    uses: esphome/workflows/.github/workflows/build.yml@9f6577fd37b5cf773ab1b9be929714a0dcd15661 # 2026.7.0
     with:
       # This overlay supplies non-production credentials and Wi-Fi solely so
       # CI can compile the otherwise dashboard-managed configuration.
