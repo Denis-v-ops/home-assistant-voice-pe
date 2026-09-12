@@ -37,6 +37,9 @@ static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
 static constexpr uint32_t TX_TASK_STACK_BYTES = 8192;
 // esp_websocket_client task_stack is expressed in bytes.
 static constexpr int WEBSOCKET_TASK_STACK_BYTES = 16384;
+// A brief Wi-Fi scheduling delay must not tear down the always-on microphone.
+// TX has its own task and the microphone ring holds 500 ms of audio.
+static constexpr uint32_t WEBSOCKET_SEND_TIMEOUT_MS = 250;
 
 static bool deadline_reached(uint32_t now, uint32_t deadline) { return static_cast<int32_t>(now - deadline) >= 0; }
 
@@ -785,8 +788,8 @@ void NovaRealtime::run_tx_task_() {
       if (this->socket_connected_ && this->client_ != nullptr) {
         int result =
             esp_websocket_client_send_text(this->client_, this->tx_control_.data.data(), this->tx_control_.length,
-                                           pdMS_TO_TICKS(50));
-        if (result < 0) {
+                                           pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
+        if (result != this->tx_control_.length) {
           ESP_LOGW(TAG, "Could not send gateway control frame");
           this->socket_connected_ = false;
           this->tx_transport_fault_ = true;
@@ -831,8 +834,8 @@ void NovaRealtime::send_audio_from_task_() {
   write_be32(frame.data() + 12, this->microphone_sample_index_);
   this->microphone_sample_index_ += MICROPHONE_FRAME_BYTES / 2;
   int result = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char *>(frame.data()), frame.size(),
-                                             pdMS_TO_TICKS(50));
-  if (result < 0) {
+                                             pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
+  if (result != static_cast<int>(frame.size())) {
     this->microphone_discontinuity_ = true;
     ESP_LOGW(TAG, "Could not send microphone frame");
     this->socket_connected_ = false;
