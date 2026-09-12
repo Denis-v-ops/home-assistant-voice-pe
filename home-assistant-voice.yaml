@@ -25,6 +25,9 @@ substitutions:
   nova_transport_enabled: "true"
   # Leave time for API log attachment before the first gateway connection.
   nova_connect_delay_ms: "10000"
+  # Spoken acknowledgements can leak through room echo as a false user turn.
+  # Keep an immediate short tone by default; opt in to the old spoken cues.
+  nova_spoken_wake_cue: "false"
   # Development defaults keep this remote package self-contained. Release
   # wrappers override the ref with the coordinated immutable tag.
   nova_repo_ref: dev
@@ -1246,12 +1249,16 @@ script:
             - nova_realtime.complete_timer_alert:
                 outcome: played
 
-  - id: play_random_wake
+  - id: play_wake_cue
     then:
       - script.execute:
           id: play_sound
           priority: true
           sound_file: !lambda |-
+            if (!${nova_spoken_wake_cue}) {
+              id(nova_rt).set_last_wake_cue(0);
+              return id(center_button_press_sound);
+            }
             static audio::AudioFile* files[] = {
               id(nova_wake_1),
               id(nova_wake_2),
@@ -1263,7 +1270,6 @@ script:
             size_t selected = esp_random() % n;
             id(nova_rt).set_last_wake_cue(selected + 1);
             return files[selected];
-      - delay: 1000ms
 
 i2s_audio:
   - id: i2s_output
@@ -1515,11 +1521,10 @@ nova_realtime:
                           condition:
                             switch.is_on: wake_sound
                           then:
-                            # The chime plays while the microphone opens; the
-                            # XMOS echo canceller removes it from the uplink.
-                            # Waiting for the chime to finish lost the first
-                            # words of anyone speaking right after "Hey Nova".
-                            - script.execute: play_random_wake
+                            # Keep listening through the short non-verbal cue.
+                            # Spoken cues can leak into ASR despite XMOS AEC;
+                            # waiting for any cue would lose command onsets.
+                            - script.execute: play_wake_cue
                       - nova_realtime.accept_wake:
   on_timer_alert:
     - script.execute: play_timer_alert

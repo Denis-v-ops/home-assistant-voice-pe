@@ -83,3 +83,16 @@ German/English conversation-stop phrases without a device-local stop model.
 See [the documentation](https://voice-pe.home-assistant.io/) for set up and troubleshooting.
 
 If you need to re-install the firmware, [use this installer](https://esphome.github.io/home-assistant-voice-pe/).
+
+### Wake acknowledgement and transport
+
+The wake acknowledgement now defaults to a short nonverbal tone. Spoken cues
+can appear in the microphone stream as a spurious user command despite XMOS echo
+cancellation. Set substitution `nova_spoken_wake_cue: "true"` to restore them.
+The microphone opens immediately in both modes. The gateway retains 240 ms of
+pre-roll to preserve commands spoken directly after the wake word.
+
+WebSocket writes tolerate 250 ms of LAN delay within the existing 500 ms
+microphone ring. A short or zero-byte write is a transport fault and causes a
+clean reconnect; it is never counted as a successfully transmitted audio frame.
+No protocol-v2 changes are needed for GPT-Live.
